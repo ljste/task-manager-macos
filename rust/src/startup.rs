@@ -12,18 +12,21 @@ extern "C" {
     fn tm_set_login_item(path: &NSString, enable: bool) -> *mut NSString;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartupKind {
     LoginItem,
     LaunchAgent,
-    Settings(&'static str),
-    Bundled(&'static str),
+    LaunchDaemon,
+    BundledLoginItem,
+    BundledAgent,
+    BundledDaemon,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Startup {
     pub name: String,
     pub kind: StartupKind,
+    pub approval_required: bool,
 }
 
 impl Startup {
@@ -31,6 +34,7 @@ impl Startup {
         Self {
             name: name.into(),
             kind,
+            approval_required: false,
         }
     }
 
@@ -38,12 +42,25 @@ impl Startup {
         match self.kind {
             StartupKind::LoginItem => "Open at Login",
             StartupKind::LaunchAgent => "Launch agent",
-            StartupKind::Settings(kind) | StartupKind::Bundled(kind) => kind,
+            StartupKind::LaunchDaemon => "Launch daemon",
+            StartupKind::BundledLoginItem => "Login helper",
+            StartupKind::BundledAgent => "Bundled launch agent",
+            StartupKind::BundledDaemon => "Bundled launch daemon",
         }
     }
 
-    pub fn can_toggle(&self) -> bool {
-        matches!(self.kind, StartupKind::LoginItem | StartupKind::LaunchAgent)
+    pub fn bundled(&self) -> bool {
+        matches!(
+            self.kind,
+            StartupKind::BundledLoginItem | StartupKind::BundledAgent | StartupKind::BundledDaemon
+        )
+    }
+
+    pub fn machine_wide(&self) -> bool {
+        matches!(
+            self.kind,
+            StartupKind::LaunchDaemon | StartupKind::BundledDaemon
+        )
     }
 }
 
@@ -142,9 +159,9 @@ fn add_bundle_helpers(
         let library = app.join("Contents/Library");
         let owner = app.file_stem().unwrap_or_default().to_string_lossy();
         for (folder, kind, job_domain) in [
-            ("LoginItems", "Login helper", domain),
-            ("LaunchAgents", "Bundled launch agent", domain),
-            ("LaunchDaemons", "Bundled launch daemon", "system"),
+            ("LoginItems", StartupKind::BundledLoginItem, domain),
+            ("LaunchAgents", StartupKind::BundledAgent, domain),
+            ("LaunchDaemons", StartupKind::BundledDaemon, "system"),
         ] {
             for path in entries(&library.join(folder)) {
                 let label = match path.extension().and_then(|p| p.to_str()) {
@@ -154,8 +171,7 @@ fn add_bundle_helpers(
                     Some("plist") if folder != "LoginItems" => plist_string(&path, "Label"),
                     _ => None,
                 };
-                let Some(label) = label.filter(|s| !s.is_empty() && !s.starts_with("com.apple."))
-                else {
+                let Some(label) = label.filter(|s| crate::services::third_party_label(s)) else {
                     continue;
                 };
                 let id = format!("{job_domain}/{label}");
@@ -179,7 +195,7 @@ fn add_bundle_helpers(
                 };
                 let service = &mut services[i];
                 let name = format!("{owner} ({label})");
-                service.startup = Some(Startup::new(&name, StartupKind::Bundled(kind)));
+                service.startup = Some(Startup::new(&name, kind));
                 service.path = path.to_string_lossy().into_owned();
                 service.program = app.to_string_lossy().into_owned();
             }
@@ -194,15 +210,9 @@ pub fn discover(
     home: &Path,
 ) {
     autoreleasepool(|_| {
-        for service in services.iter_mut().filter(|s| s.startup.is_some()) {
-            if requires_approval(&service.path) {
-                service.disabled = true;
-                let kind = if service.domain == "system" {
-                    "Launch daemon"
-                } else {
-                    "Launch agent"
-                };
-                service.startup = Some(Startup::new(&service.label, StartupKind::Settings(kind)));
+        for service in services.iter_mut() {
+            if let Some(item) = &mut service.startup {
+                item.approval_required = requires_approval(&service.path);
             }
         }
         let login = login_items();
@@ -226,7 +236,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundled_helpers_require_a_job_or_override_and_stay_system_managed() {
+    fn registered_bundled_helpers_offer_the_inverse_startup_action() {
         let root =
             std::env::temp_dir().join(format!("task-manager-startup-test-{}", std::process::id()));
         let app = root.join("Example.app");
@@ -234,33 +244,34 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let config = folder.join("example.plist");
         std::fs::write(&config, "<plist version=\"1.0\"><dict><key>Label</key><string>org.example.agent</string></dict></plist>").unwrap();
-        let domain = "gui/501";
+        let domain = format!("gui/{}", unsafe { libc::getuid() });
         let mut services = Vec::new();
         add_bundle_helpers(
             &mut services,
             std::slice::from_ref(&app),
-            domain,
+            &domain,
             &HashMap::new(),
         );
         assert!(services.is_empty());
-        for (disabled, expected) in [(true, "Disabled"), (false, "See Settings")] {
+        for (disabled, expected) in [(true, "Disabled"), (false, "Allowed")] {
             services.clear();
             let overrides = HashMap::from([(format!("{domain}/org.example.agent"), disabled)]);
             add_bundle_helpers(
                 &mut services,
                 std::slice::from_ref(&app),
-                domain,
+                &domain,
                 &overrides,
             );
             add_bundle_helpers(
                 &mut services,
                 std::slice::from_ref(&app),
-                domain,
+                &domain,
                 &overrides,
             );
             assert_eq!(services.len(), 1);
             assert_eq!(services[0].startup_status(), expected);
-            assert!(!services[0].permits("enable") && !services[0].permits("disable"));
+            assert_eq!(services[0].permits("enable"), disabled);
+            assert_eq!(services[0].permits("disable"), !disabled);
         }
         std::fs::remove_dir_all(root).unwrap();
     }

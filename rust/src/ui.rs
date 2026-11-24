@@ -129,7 +129,7 @@ define_class!(
           if table_pointer_action(&before) { self.redraw_interaction(true); } else { self.invalidate_canvas(); }
       }
   }
-  #[unsafe(method(scrollWheel:))]fn scroll_wheel(&self,e:&NSEvent){let mut s=self.ivars().state.borrow_mut();if let Some(d)=&s.dialog{if d.title.ends_with(" Properties"){s.dialog_scroll=(s.dialog_scroll-e.scrollingDeltaY()*8.).max(0.);drop(s);self.redraw();}return}if !s.menus.is_empty(){return}let factor=if e.hasPreciseScrollingDeltas(){1.}else{20.};if s.page==7{s.scroll=(s.scroll-e.scrollingDeltaY()*factor).clamp(0.,s.max_scroll());}else if ![1,7].contains(&s.page){s.scroll-=e.scrollingDeltaY()*factor;s.hscroll-=e.scrollingDeltaX()*factor;s.clamp_scroll();}drop(s);self.redraw_interaction(true);}
+  #[unsafe(method(scrollWheel:))]fn scroll_wheel(&self,e:&NSEvent){let mut s=self.ivars().state.borrow_mut();if let Some(d)=&s.dialog{if d.title.ends_with(" Properties") || matches!(d.action, Action::ConfirmServices(_)){s.dialog_scroll=(s.dialog_scroll-e.scrollingDeltaY()*8.).max(0.);drop(s);self.redraw();}return}if !s.menus.is_empty(){return}let factor=if e.hasPreciseScrollingDeltas(){1.}else{20.};if s.page==7{s.scroll=(s.scroll-e.scrollingDeltaY()*factor).clamp(0.,s.max_scroll());}else if ![1,7].contains(&s.page){s.scroll-=e.scrollingDeltaY()*factor;s.hscroll-=e.scrollingDeltaX()*factor;s.clamp_scroll();}drop(s);self.redraw_interaction(true);}
   #[unsafe(method(keyDown:))]fn key_down(&self,e:&NSEvent){if !self.key(e){unsafe{let _:()=msg_send![super(self),keyDown:e];}}}
   #[unsafe(method(performKeyEquivalent:))]fn equivalent(&self,e:&NSEvent)->bool{self.key(e)}
   #[unsafe(method(workspaceAppsChanged:))]
@@ -914,7 +914,18 @@ impl Canvas {
                 changed |= rows_changed;
             }
             for r in results {
-                s.busy = false;
+                let r = match r {
+                    Delivery::ServiceChange(result) => {
+                        s.service_change_pending = false;
+                        Delivery::Operation(result)
+                    }
+                    other => {
+                        if matches!(other, Delivery::Power(_) | Delivery::Operation(_)) {
+                            s.busy = false;
+                        }
+                        other
+                    }
+                };
                 match r {
                     Delivery::Operation(Err(e)) => {
                         s.dialog = Some(Dialog {
@@ -1419,26 +1430,44 @@ impl Canvas {
   else if value=="theme:light"{s.prefs.dark=false;s.prefs.system_theme=false;}else if value=="theme:dark"{s.prefs.dark=true;s.prefs.system_theme=false;}else if value=="theme:system"{s.prefs.system_theme=true;s.prefs.dark=NSUserDefaults::standardUserDefaults().stringForKey(ns_string!("AppleInterfaceStyle")).is_some();}
   else if let Some(n)=value.strip_prefix("history:").and_then(|n|n.parse::<usize>().ok()){s.prefs.graph_seconds=n.clamp(30,300);}
   else if value=="units:binary"{s.prefs.binary=true;s.rebuild();}else if value=="units:decimal"{s.prefs.binary=false;s.rebuild();}
-  else if let Some(a)=value.strip_prefix("service-confirm:"){if let Some(i)=s.current().and_then(|r|r.service){let service=s.services[i].clone();let a=a.to_string();let shared=s.shared.clone();s.busy=true;std::thread::spawn(move||{let result=services::change(&service,&a);let mut q=shared.data.lock().unwrap();q.results.push_back(Delivery::Operation(result));q.scan=true;shared.wake.notify_all();drop(q);shared.notify_ui();});}}
   s.prefs.save();
  },
  Action::Service(action) => {
-     if let Some(item) = s.current().and_then(|row| row.service).map(|i| &s.services[i]) {
-         if !s.busy && item.permits(&action) {
-             let (title, message) = if matches!(action.as_str(), "enable" | "disable") {
-                 let name = item.startup.as_ref().map_or(&item.label, |startup| &startup.name);
-                 (format!("{} startup item?", if action == "enable" { "Enable" } else { "Disable" }),
-                  format!("{name}\nThis changes what starts at login for your account."))
-             } else {
-                 (format!("{} service?", action.to_uppercase()), format!("{}\nThis changes your user LaunchAgent and can affect its running application.", item.label))
-             };
-             s.dialog = Some(Dialog { title, message, ok: action.clone(), action: Action::Option(format!("service-confirm:{action}")), input: false });
+     if !s.busy && !s.service_change_pending {
+         let items = s.service_targets(&action).into_iter().cloned().collect::<Vec<_>>();
+         if !items.is_empty() {
+             s.dialog_scroll = 0.;
+             s.dialog = Some(service_confirmation(ServiceRequest { action, items }));
          }
      }
  },
+ Action::ConfirmServices(request) => {
+     if s.service_change_pending { return; }
+     s.service_change_pending = true;
+     let shared = s.shared.clone();
+     std::thread::spawn(move || {
+         let result = match request.action.as_str() {
+             "enable" | "disable" => services::change_startup(&request.items, request.action == "disable"),
+             action => services::change_service(&request.items[0], action),
+         };
+         let result = result.map_err(|error| {
+             if request.items.len() > 1 {
+                 format!("{error}\nThe list will refresh to show which items changed.")
+             } else {
+                 error
+             }
+         });
+         let mut q = shared.data.lock().unwrap();
+         q.results.push_back(Delivery::ServiceChange(result));
+         q.scan = true;
+         shared.wake.notify_all();
+         drop(q);
+         shared.notify_ui();
+     });
+ },
  Action::Refresh=>{let mut q=s.shared.data.lock().unwrap();q.refresh=true;q.scan=q.services_visible;s.shared.wake.notify_all();},Action::ResetHistory=>{s.history=Default::default();s.rebuild();},Action::Logical(on)=>s.prefs.logical=on,Action::Kernel=>s.prefs.kernel=!s.prefs.kernel,Action::Summary=>s.summary=!s.summary,Action::GraphOnly=>s.graph_only=!s.graph_only,
  Action::Copy=>{let text=if s.page==1{format!("{}\nCPU: {:0.1}%\nMemory: {} / {}\nLogical processors: {}",model::cstr(&s.system.raw.brand),s.system.cpu,model::bytes(s.system.used()as f64,s.prefs.binary),model::bytes(s.system.raw.ram as f64,s.prefs.binary),s.system.raw.logical)}else{s.current().map(|r|format!("{}\n{}",r.name,s.columns.iter().map(|c|format!("{}: {}",c.title,s.row_value(r,&c.key))).collect::<Vec<_>>().join("\n"))).unwrap_or_default()};let pb=NSPasteboard::generalPasteboard();pb.clearContents();unsafe{pb.setString_forType(&NSString::from_str(&text),NSPasteboardTypeString);}},
- Action::Properties=>{s.inspector_generation=s.inspector_generation.wrapping_add(1);let generation=s.inspector_generation;s.dialog_scroll=0.;if let Some(r)=s.current().cloned(){if let Some(process)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let message=process_details(&process);shared.deliver(Delivery::Inspector(generation,message));});}let message=if let Some(i)=r.service{let q=&s.services[i];if let Some(item)=q.startup.as_ref().filter(|_|s.page==3){let control=if item.can_toggle(){"Task Manager"}else{"System Settings > General > Login Items"};format!("{}\nType: {}\nStartup: {}\nManaged in: {}\nLocation: {}",item.name,item.description(),q.startup_status(),control,q.path)}else{format!("Name: {}\nStatus: {}\nDomain: {}\nProgram: {}\nConfiguration: {}",q.label,q.status(),q.domain,q.program,q.path)}}else if let Some(p)=s.process(){format!("Name: {}\nPID: {}  Parent PID: {}\nUser: {}  Status: {}\nCPU: {:0.1}%  Memory: {}\nPath: {}",p.info.name,p.raw.pid,p.raw.ppid,p.info.user,p.status(),p.cpu,model::bytes(p.raw.memory as f64,s.prefs.binary),p.info.path)}else{r.name.clone()};s.dialog=Some(Dialog{title:format!("{} Properties",r.name),message,ok:"OK".into(),action:Action::None,input:false});}},
+ Action::Properties=>{s.inspector_generation=s.inspector_generation.wrapping_add(1);let generation=s.inspector_generation;s.dialog_scroll=0.;if let Some(r)=s.current().cloned(){if let Some(process)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let message=process_details(&process);shared.deliver(Delivery::Inspector(generation,message));});}let message=if let Some(i)=r.service{let q=&s.services[i];if let Some(item)=q.startup.as_ref().filter(|_|s.page==3){let scope=if item.machine_wide(){"All users on this Mac"}else{"Your account"};let approval=if item.approval_required{"\nmacOS background permission: Approval required"}else if item.bundled(){"\nmacOS manages background permission separately."}else{""};format!("{}\nType: {}\nStartup: {}\nScope: {}{}\nLocation: {}",item.name,item.description(),q.startup_status(),scope,approval,q.path)}else{format!("Name: {}\nStatus: {}\nDomain: {}\nProgram: {}\nConfiguration: {}",q.label,q.status(),q.domain,q.program,q.path)}}else if let Some(p)=s.process(){format!("Name: {}\nPID: {}  Parent PID: {}\nUser: {}  Status: {}\nCPU: {:0.1}%  Memory: {}\nPath: {}",p.info.name,p.raw.pid,p.raw.ppid,p.info.user,p.status(),p.cpu,model::bytes(p.raw.memory as f64,s.prefs.binary),p.info.path)}else{r.name.clone()};s.dialog=Some(Dialog{title:format!("{} Properties",r.name),message,ok:"OK".into(),action:Action::None,input:false});}},
  Action::Reveal=>{let path=s.process().map(|p|p.info.path.clone()).or_else(||s.current().and_then(|r|r.service).map(|i|s.services[i].path.clone()));if let Some(path)=path{std::thread::spawn(move||{let _=services::command("/usr/bin/open",&["-R",&path],Duration::from_secs(5));});}},Action::SearchOnline=>{if let Some(r)=s.current(){let encoded=r.name.bytes().map(|b|if b.is_ascii_alphanumeric()||b==b'-'{(b as char).to_string()}else{format!("%{b:02X}")}).collect::<String>();open_url(&format!("https://www.bing.com/search?q={encoded}"));}},
  Action::GoDetails=>{let pid=s.process().map(|p|p.id()).or_else(||s.current().and_then(|r|r.service).and_then(|i|s.services[i].pid).and_then(|pid|s.records.iter().find(|p|p.raw.pid==pid).map(|p|p.id())));s.set_page(5);s.selected=pid;s.selected_visible();},
  Action::Switch=>{if s.page==2{if let Some(row)=s.current(){let path=row.icon.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});}}else if let Some(p)=s.process(){if !p.info.app.is_empty(){let path=p.info.app.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});if s.prefs.minimize{if let Some(w)=self.window(){w.miniaturize(None);}}}}},
@@ -1557,27 +1586,76 @@ fn view_menu(s: &State) -> Vec<MenuItem> {
     }
     v
 }
+fn service_confirmation(request: ServiceRequest) -> Dialog {
+    let verb = match request.action.as_str() {
+        "enable" => "Enable",
+        "disable" => "Disable",
+        "start" => "Start",
+        "stop" => "Stop",
+        _ => "Restart",
+    };
+    let (title, message) = if matches!(request.action.as_str(), "enable" | "disable") {
+        let count = request.items.len();
+        let title = if count == 1 {
+            format!("{verb} startup item?")
+        } else {
+            format!("{verb} {count} startup items?")
+        };
+        let system_count = request
+            .items
+            .iter()
+            .filter(|s| s.domain == "system")
+            .count();
+        let mut message = if system_count == 0 {
+            "This changes startup for your account.".to_owned()
+        } else {
+            format!("Mac-wide helpers affect all users ({system_count} selected). macOS may ask for administrator approval once.")
+        };
+        if request.items.iter().any(|s| s.domain != "login") {
+            message.push_str("\nThe change takes effect the next time a helper loads.");
+            if request.action == "enable" {
+                message.push_str(" macOS background permission still applies.");
+            }
+        }
+        for item in &request.items {
+            message.push('\n');
+            message.push_str(item.startup.as_ref().map_or(&item.label, |s| &s.name));
+            if item.domain == "system" {
+                message.push_str(" (all users)");
+            }
+        }
+        (title, message)
+    } else {
+        (
+            format!("{verb} service?"),
+            format!(
+                "{}\nThis changes your user LaunchAgent and can affect its running application.",
+                request.items[0].label
+            ),
+        )
+    };
+    Dialog {
+        title,
+        message,
+        ok: verb.into(),
+        action: Action::ConfirmServices(Box::new(request)),
+        input: false,
+    }
+}
+
 fn row_menu(s: &State) -> Vec<MenuItem> {
     let Some(r) = s.current() else {
         return view_menu(s);
     };
     if s.page == 6 || s.page == 3 {
-        let service = r.service.map(|i| &s.services[i]);
         let mut v = vec![];
         for (t, a) in if s.page == 3 {
-            if service
-                .and_then(|s| s.startup.as_ref())
-                .is_some_and(|entry| entry.can_toggle())
-            {
-                vec![("Enable", "enable"), ("Disable", "disable")]
-            } else {
-                vec![]
-            }
+            vec![("Enable", "enable"), ("Disable", "disable")]
         } else {
             vec![("Start", "start"), ("Stop", "stop"), ("Restart", "restart")]
         } {
             let mut i = MenuItem::new(t, Action::Service(a.into()));
-            i.enabled = !s.busy && service.is_some_and(|item| item.permits(a));
+            i.enabled = !s.busy && !s.service_change_pending && !s.service_targets(a).is_empty();
             v.push(i)
         }
         v.extend([
@@ -2022,6 +2100,14 @@ impl Canvas {
                 let _: () = msg_send![&*node,setAccessibilityLabel:&*NSString::from_str(&h.label)];
                 let _: () = msg_send![&*node,setAccessibilityEnabled:h.enabled];
                 let _: () = msg_send![&*node,setAccessibilityParent:self];
+            }
+            if h.action == Action::DialogOk {
+                if let Some(d) = &s.dialog {
+                    let help = NSString::from_str(&format!("{}\n{}", d.title, d.message));
+                    unsafe {
+                        let _: () = msg_send![&*node, setAccessibilityHelp: &*help];
+                    }
+                }
             }
             if let Some(w) = &window {
                 let frame = self.convertRect_toView(draw::nsrect(h.rect), None);

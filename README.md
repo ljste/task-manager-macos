@@ -10,7 +10,7 @@ The layout follows Windows 11 22H2, with right-hand window controls, eight navig
 
 Targets **M1 and later M-series Macs on macOS 14 or later**. The build uses general `arm64`, with processor counts and metrics discovered at runtime.
 
-The current release was benchmarked on a **10-core Apple M2 Pro with 16 GB RAM** running macOS 27.2.1. The original release was tested on a **16-inch MacBook Pro (2026), model Mac17,8, with an 18-core M5 Pro and 48 GB RAM** running macOS 26.5.1, using Rust 1.98.1 and Apple Command Line Tools. Other M-series configurations and older supported macOS releases remain compatibility targets. Intel is outside the build target.
+The performance measurements below were taken on a **10-core Apple M2 Pro with 16 GB RAM** running macOS 27.2.1. The original release was tested on a **16-inch MacBook Pro (2026), model Mac17,8, with an 18-core M5 Pro and 48 GB RAM** running macOS 26.5.1, using Rust 1.98.1 and Apple Command Line Tools. Other M-series configurations and older supported macOS releases remain compatibility targets. Intel is outside the build target.
 
 ## Download and build
 
@@ -37,7 +37,7 @@ The former Swift implementation remains in `Sources/` and `Tests/` as a historic
 - **Performance:** choose CPU, Memory, Disk 0, Network, or GPU 0. Right-click CPU → Change graph to → Logical processors. Kernel overlays, graph summary view, and copying are supported. Double-click a main graph to toggle summary; Escape exits it.
 - **Efficiency mode:** controls the current power source's actual macOS Low Power Mode for the whole Mac. A confirmation explains this scope; macOS asks for administrator authorization. Turning it off restores the saved previous mode, including High Power where supported. Other power-source profiles are preserved. It is not Windows per-process EcoQoS.
 - **App history:** records observed CPU time locally. Show history for all processes is optional. Windows-only network/notification accounting is explicitly unavailable.
-- **Startup apps** shows Open at Login entries, launch agents and registered background helpers. Select an Open at Login item or an eligible launch agent to enable or disable it for your account. Login items disabled here stay in the list so you can enable them again. Use **Open Login Items** for background permissions and helpers managed by macOS. Returning to Task Manager refreshes the list.
+- **Startup apps** shows Open at Login items, launch agents and registered background helpers. Select a row and choose **Disable** or **Enable**. Command-click or Shift-click to change several together. Account helpers need no administrator password. For Mac-wide daemons, Task Manager requests administrator approval once for the selected group. Disabling a helper prevents future loads. An already running helper can continue until it exits. Enabling restores its launchd policy, subject to macOS background permission. **Open Login Items** is available if you want to review that separate permission.
 - **Services** shows launchd jobs. Start, stop and restart are available for eligible LaunchAgents in your own Library.
 - **Users:** expand a user to see their processes. System service accounts are excluded. Disconnect is unavailable.
 - **Settings:** start page, update interval, pause, window behavior, grouping, history visibility, graph interval, units, theme, and launch at login. Login registration uses Apple's ServiceManagement API and may need approval in System Settings.

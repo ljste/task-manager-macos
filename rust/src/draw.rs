@@ -659,18 +659,15 @@ pub fn render(p: &mut Painter, s: &mut State) {
                     } else {
                         ("Disable", "disable", "end")
                     };
-                    if item
-                        .and_then(|service| service.startup.as_ref())
-                        .is_none_or(|entry| entry.can_toggle())
-                    {
-                        commands.push((
-                            title,
-                            icon,
-                            Action::Service(action.into()),
-                            !s.busy && item.is_some_and(|item| item.permits(action)),
-                            92.,
-                        ));
-                    }
+                    commands.push((
+                        title,
+                        icon,
+                        Action::Service(action.into()),
+                        !s.busy
+                            && !s.service_change_pending
+                            && item.is_some_and(|s| s.permits(action)),
+                        92.,
+                    ));
                     commands.push((
                         "Open Login Items",
                         "",
@@ -700,7 +697,9 @@ pub fn render(p: &mut Painter, s: &mut State) {
                     let mutable = s
                         .current()
                         .and_then(|r| r.service)
-                        .is_some_and(|i| s.services[i].mutable);
+                        .is_some_and(|i| s.services[i].mutable)
+                        && !s.service_change_pending
+                        && !s.busy;
                     commands.push(("Start", "", Action::Service("start".into()), mutable, 65.));
                     commands.push(("Stop", "", Action::Service("stop".into()), mutable, 65.));
                     commands.push((

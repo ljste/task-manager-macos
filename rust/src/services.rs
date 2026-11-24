@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Service {
     pub label: String,
     pub program: String,
@@ -21,10 +21,7 @@ pub struct Service {
 impl Service {
     pub fn permits(&self, action: &str) -> bool {
         match action {
-            "enable" | "disable" => {
-                self.startup.as_ref().is_some_and(Startup::can_toggle)
-                    && self.disabled == (action == "enable")
-            }
+            "enable" | "disable" => self.startup.is_some() && self.disabled == (action == "enable"),
             "start" | "stop" | "restart" => self.mutable,
             _ => false,
         }
@@ -33,12 +30,10 @@ impl Service {
     pub fn startup_status(&self) -> &'static str {
         if self.disabled {
             "Disabled"
-        } else if self
-            .startup
-            .as_ref()
-            .is_some_and(|s| matches!(s.kind, StartupKind::Bundled(_)))
-        {
-            "See Settings"
+        } else if self.startup.as_ref().is_some_and(|s| s.approval_required) {
+            "Needs approval"
+        } else if self.startup.as_ref().is_some_and(Startup::bundled) {
+            "Allowed"
         } else {
             "Enabled"
         }
@@ -156,11 +151,11 @@ pub fn scan(startup: bool) -> Vec<Service> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for (folder, dom) in [
+        ("/System/Library/LaunchAgents", &*domain),
+        ("/System/Library/LaunchDaemons", "system"),
         (&*local, &*domain),
         ("/Library/LaunchAgents", &*domain),
         ("/Library/LaunchDaemons", "system"),
-        ("/System/Library/LaunchAgents", &*domain),
-        ("/System/Library/LaunchDaemons", "system"),
     ] {
         let Ok(files) = std::fs::read_dir(folder) else {
             continue;
@@ -189,11 +184,8 @@ pub fn scan(startup: bool) -> Vec<Service> {
                 .unwrap_or("–");
             let j = if dom == "system" { &system } else { &user };
             let ov = if dom == "system" { &sd } else { &ud };
-            let agent = dom == domain
-                && !folder.starts_with("/System/")
-                && !label.is_empty()
-                && !label.starts_with("com.apple.")
-                && !label.contains('/');
+            let agent =
+                dom == domain && !folder.starts_with("/System/") && third_party_label(label);
             let mutable = agent
                 && folder == local
                 && path
@@ -220,8 +212,8 @@ pub fn scan(startup: bool) -> Vec<Service> {
                 mutable,
                 startup: if agent {
                     Some(Startup::new(label, StartupKind::LaunchAgent))
-                } else if folder == "/Library/LaunchDaemons" && !label.starts_with("com.apple.") {
-                    Some(Startup::new(label, StartupKind::Settings("Launch daemon")))
+                } else if folder == "/Library/LaunchDaemons" && third_party_label(label) {
+                    Some(Startup::new(label, StartupKind::LaunchDaemon))
                 } else {
                     None
                 },
@@ -265,39 +257,167 @@ pub fn scan(startup: bool) -> Vec<Service> {
     result.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
     result
 }
-pub fn change(s: &Service, action: &str) -> Result<String, String> {
-    if s.startup
-        .as_ref()
-        .is_some_and(|i| i.kind == StartupKind::LoginItem)
-    {
-        return crate::startup::change_login_item(&s.path, action);
+pub fn third_party_label(label: &str) -> bool {
+    !label.trim().is_empty()
+        && !label.starts_with("com.apple.")
+        && !label.contains('/')
+        && !label.chars().any(char::is_control)
+}
+
+#[derive(Default)]
+struct StartupChanges<'a> {
+    system: Vec<&'a Service>,
+    user: Vec<&'a Service>,
+    login: Vec<&'a Service>,
+}
+
+fn plan_changes<'a>(
+    selected: &[Service],
+    current: &'a [Service],
+    gui_domain: &str,
+) -> Result<StartupChanges<'a>, String> {
+    let mut plan = StartupChanges::default();
+    for item in selected {
+        let fresh = current
+            .iter()
+            .find(|s| s.domain == item.domain && s.label == item.label)
+            .ok_or_else(|| format!("{} is no longer available.", item.label))?;
+        let startup = fresh
+            .startup
+            .as_ref()
+            .ok_or("This item is no longer a startup item.")?;
+        if item.startup.as_ref().map(|s| s.kind) != Some(startup.kind)
+            || fresh.path.is_empty()
+            || fresh.path != item.path
+            || fresh.program != item.program
+        {
+            return Err(format!(
+                "The configuration for {} has changed. Refresh and try again.",
+                item.label
+            ));
+        }
+        match startup.kind {
+            StartupKind::LoginItem if fresh.domain == "login" && fresh.label == fresh.path => {
+                plan.login.push(fresh)
+            }
+            _ if !third_party_label(&fresh.label) => {
+                return Err("Invalid launchd helper label.".into())
+            }
+            StartupKind::BundledDaemon | StartupKind::LaunchDaemon if fresh.domain == "system" => {
+                plan.system.push(fresh)
+            }
+            StartupKind::LaunchAgent
+            | StartupKind::BundledAgent
+            | StartupKind::BundledLoginItem
+                if fresh.domain == gui_domain =>
+            {
+                plan.user.push(fresh)
+            }
+            _ => return Err("This startup item belongs to a different launchd domain.".into()),
+        }
     }
+    Ok(plan)
+}
+
+const SYSTEM_STARTUP_SCRIPT: &str = r#"on run argv
+    set verb to item 1 of argv
+    if verb is not in {"disable", "enable"} then error "Unknown startup action."
+    set commands to "set -e"
+    repeat with target in rest of argv
+        set commands to commands & linefeed & "/bin/launchctl " & verb & " " & quoted form of (contents of target)
+    end repeat
+    try
+        do shell script commands with administrator privileges with prompt "Task Manager wants to change startup for the selected helpers on this Mac."
+    on error number -128
+        return "cancelled"
+    end try
+    return "applied"
+end run"#;
+
+fn write_system_policy(action: &str, targets: &[String]) -> Result<bool, String> {
+    let mut args = vec!["-e", SYSTEM_STARTUP_SCRIPT, action];
+    args.extend(targets.iter().map(String::as_str));
+    let output = command("/usr/bin/osascript", &args, Duration::from_secs(120))?;
+    match output.trim() {
+        "applied" => Ok(true),
+        "cancelled" => Ok(false),
+        _ => Err("macOS did not confirm the administrator request.".into()),
+    }
+}
+
+fn apply_policy(
+    items: &[&Service],
+    disable: bool,
+    read: impl Fn() -> Result<HashMap<String, bool>, String>,
+    write: impl FnOnce(&[String]) -> Result<bool, String>,
+) -> Result<bool, String> {
+    if items.is_empty() {
+        return Ok(true);
+    }
+    let before = read()?;
+    let pending: Vec<_> = items
+        .iter()
+        .filter(|s| before.get(&s.label).copied().unwrap_or(s.disabled) != disable)
+        .collect();
+    if pending.is_empty() {
+        return Ok(true);
+    }
+    let targets = pending.iter().map(|s| s.id()).collect::<Vec<_>>();
+    if !write(&targets)? {
+        return Ok(false);
+    }
+    let after = read()?;
+    for s in pending {
+        if after.get(&s.label) != Some(&disable) {
+            return Err(format!(
+                "launchd did not confirm the change to {}.",
+                s.label
+            ));
+        }
+    }
+    Ok(true)
+}
+
+pub fn change_startup(selected: &[Service], disable: bool) -> Result<String, String> {
+    let action = if disable { "disable" } else { "enable" };
+    let gui_domain = format!("gui/{}", unsafe { libc::getuid() });
+    let current = scan(true);
+    let plan = plan_changes(selected, &current, &gui_domain)?;
+    let policies = |domain: &str| launch(&["print-disabled", domain]).map(|s| disabled(&s));
+    if !apply_policy(
+        &plan.system,
+        disable,
+        || policies("system"),
+        |targets| write_system_policy(action, targets),
+    )? {
+        return Ok(String::new());
+    }
+    apply_policy(
+        &plan.user,
+        disable,
+        || policies(&gui_domain),
+        |targets| {
+            for target in targets {
+                launch(&[action, target])?;
+            }
+            Ok(true)
+        },
+    )?;
+    for item in plan.login {
+        if item.disabled != disable {
+            crate::startup::change_login_item(&item.path, action)?;
+        }
+    }
+    Ok(String::new())
+}
+
+pub fn change_service(s: &Service, action: &str) -> Result<String, String> {
     let current = scan(false)
         .into_iter()
         .find(|n| n.id() == s.id())
         .ok_or("The service is no longer available.")?;
     if current.path != s.path {
         return Err("The service configuration has changed. Refresh and try again.".into());
-    }
-    if matches!(action, "enable" | "disable")
-        && current
-            .startup
-            .as_ref()
-            .is_some_and(|i| i.kind == StartupKind::LaunchAgent)
-        && s.startup
-            .as_ref()
-            .is_some_and(|i| i.kind == StartupKind::LaunchAgent)
-    {
-        if action == "enable" && crate::startup::requires_approval(&current.path) {
-            return Err("Allow this item in System Settings > General > Login Items first.".into());
-        }
-        launch(&[action, &current.id()])?;
-        let overrides = disabled(&launch(&["print-disabled", &current.domain])?);
-        return if overrides.get(&current.label) == Some(&(action == "disable")) {
-            Ok(String::new())
-        } else {
-            Err("launchd did not confirm the startup change.".into())
-        };
     }
     if !current.mutable {
         return Err("Only your own non-system LaunchAgents can be changed.".into());
@@ -343,6 +463,115 @@ mod tests {
             ])
         );
     }
+    fn helper(label: &str, domain: &str, kind: StartupKind) -> Service {
+        Service {
+            label: label.into(),
+            domain: domain.into(),
+            path: format!("/Example.app/Contents/Library/{label}.plist"),
+            startup: Some(Startup::new(label, kind)),
+            ..Service::default()
+        }
+    }
+
+    #[test]
+    fn changes_use_the_confirmed_helpers_in_their_own_domains() {
+        let gui = "gui/501";
+        let agent = helper("org.example.agent", gui, StartupKind::BundledAgent);
+        let daemon = helper("org.example.daemon", "system", StartupKind::BundledDaemon);
+        let login = helper("org.example.login", gui, StartupKind::BundledLoginItem);
+        let selected = [agent.clone(), daemon.clone(), login.clone()];
+        let inventory = [login.clone(), daemon.clone(), agent.clone()];
+        let plan = plan_changes(&selected, &inventory, gui).unwrap();
+        assert_eq!(plan.system, [&daemon]);
+        assert_eq!(plan.user, [&agent, &login]);
+        let mut replaced = inventory;
+        replaced[1].program = "/Different.app".into();
+        assert!(plan_changes(&selected, &replaced, gui).is_err());
+        assert!(plan_changes(&selected, &replaced[..1], gui).is_err());
+        for invalid in [
+            helper("com.apple.protected", "system", StartupKind::LaunchDaemon),
+            helper("../other/job", "system", StartupKind::BundledDaemon),
+            helper("org.example.agent", "system", StartupKind::BundledAgent),
+            helper("org.example.agent", "gui/502", StartupKind::LaunchAgent),
+        ] {
+            let items = std::slice::from_ref(&invalid);
+            assert!(plan_changes(items, items, gui).is_err());
+        }
+    }
+
+    #[test]
+    fn one_request_covers_the_group_and_a_repeat_skips_authorization() {
+        let first = helper("org.example.a", "system", StartupKind::LaunchDaemon);
+        let second = helper("org.example.b", "system", StartupKind::BundledDaemon);
+        let policies = std::cell::RefCell::new(HashMap::new());
+        let read = || Ok(policies.borrow().clone());
+        assert!(apply_policy(&[&first, &second], true, read, |targets| {
+            assert_eq!(targets, [first.id(), second.id()]);
+            policies.replace(HashMap::from([
+                (first.label.clone(), true),
+                (second.label.clone(), true),
+            ]));
+            Ok(true)
+        })
+        .unwrap());
+        assert!(apply_policy(&[&first, &second], true, read, |_| panic!(
+            "already disabled"
+        ))
+        .unwrap());
+    }
+
+    #[test]
+    fn retry_after_partial_failure_only_writes_remaining_helpers() {
+        let a = helper("org.example.a", "system", StartupKind::LaunchDaemon);
+        let b = helper("org.example.b", "system", StartupKind::LaunchDaemon);
+        let policies = std::cell::RefCell::new(HashMap::new());
+        let read = || Ok(policies.borrow().clone());
+        let items = [&a, &b];
+        assert!(apply_policy(&items, true, read, |_| {
+            policies.borrow_mut().insert(a.label.clone(), true);
+            Err("change denied".into())
+        })
+        .is_err());
+        assert!(apply_policy(&items, true, read, |targets| {
+            assert_eq!(targets, [b.id()]);
+            policies.borrow_mut().insert(b.label.clone(), true);
+            Ok(true)
+        })
+        .unwrap());
+    }
+
+    #[test]
+    fn cancellation_denial_and_unconfirmed_changes_do_not_retry() {
+        let item = helper("org.example.a", "system", StartupKind::LaunchDaemon);
+        let read = || Ok(HashMap::new());
+        assert!(!apply_policy(&[&item], true, read, |_| Ok(false)).unwrap());
+        assert_eq!(
+            apply_policy(&[&item], true, read, |_| Err("denied".into())),
+            Err("denied".into())
+        );
+        assert!(apply_policy(&[&item], true, read, |_| Ok(true))
+            .unwrap_err()
+            .contains(&item.label));
+        assert!(apply_policy(
+            &[&item],
+            true,
+            || Err("read failed".into()),
+            |_| panic!("missing policy")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn background_approval_and_launchd_policy_are_independent() {
+        let mut item = helper("org.example.a", "gui/501", StartupKind::LaunchAgent);
+        item.startup.as_mut().unwrap().approval_required = true;
+        assert_eq!(item.startup_status(), "Needs approval");
+        assert!(item.permits("disable"));
+        item.disabled = true;
+        assert_eq!(item.startup_status(), "Disabled");
+        assert!(item.permits("enable"));
+    }
+
     #[test]
     fn timeout() {
         assert!(command("/bin/sleep", &["2"], Duration::from_millis(30)).is_err())

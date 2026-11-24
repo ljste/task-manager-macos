@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "task-manager"
-version = "2.1.1"
+version = "2.1.2"
 dependencies = [
  "cc",
  "dispatch2",

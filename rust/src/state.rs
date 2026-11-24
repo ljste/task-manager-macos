@@ -89,6 +89,12 @@ pub fn refresh_interval(speed: u64) -> Option<Duration> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ServiceRequest {
+    pub action: String,
+    pub items: Vec<Service>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     None,
     Page(usize),
@@ -115,6 +121,7 @@ pub enum Action {
     Signal(i32),
     Priority(i32),
     Service(String),
+    ConfirmServices(Box<ServiceRequest>),
     Refresh,
     ResetHistory,
     GraphOnly,
@@ -351,6 +358,7 @@ pub struct Dialog {
 }
 pub enum Delivery {
     Operation(Result<String, String>),
+    ServiceChange(Result<String, String>),
     Power(Result<(String, u8, u8), String>),
     Inspector(u64, String),
 }
@@ -454,6 +462,7 @@ pub struct State {
     pub memory_percent: bool,
     pub login_enabled: bool,
     pub busy: bool,
+    pub service_change_pending: bool,
     pub shared: Arc<Feed>,
     pub width: f64,
     pub height: f64,
@@ -522,6 +531,7 @@ impl State {
             memory_percent: false,
             login_enabled: false,
             busy: false,
+            service_change_pending: false,
             shared,
             width: 1120.,
             height: 720.,
@@ -605,6 +615,24 @@ impl State {
             .as_ref()
             .and_then(|id| self.rows.iter().find(|r| &r.id == id))
     }
+    pub fn service_targets(&self, action: &str) -> Vec<&Service> {
+        if self.page != 3 {
+            return self
+                .current()
+                .and_then(|r| r.service)
+                .map(|i| &self.services[i])
+                .filter(|s| s.permits(action))
+                .into_iter()
+                .collect();
+        }
+        self.rows
+            .iter()
+            .filter(|r| self.selections.contains(&r.id) || self.selected.as_ref() == Some(&r.id))
+            .filter_map(|r| r.service.map(|i| &self.services[i]))
+            .filter(|s| s.permits(action))
+            .collect()
+    }
+
     pub fn process(&self) -> Option<&Process> {
         self.current()?
             .members
