@@ -1,3 +1,4 @@
+use crate::startup::{Startup, StartupKind};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
@@ -15,8 +16,34 @@ pub struct Service {
     pub disabled: bool,
     pub mutable: bool,
     pub loaded: bool,
+    pub startup: Option<Startup>,
 }
 impl Service {
+    pub fn permits(&self, action: &str) -> bool {
+        match action {
+            "enable" | "disable" => {
+                self.startup.as_ref().is_some_and(Startup::can_toggle)
+                    && self.disabled == (action == "enable")
+            }
+            "start" | "stop" | "restart" => self.mutable,
+            _ => false,
+        }
+    }
+
+    pub fn startup_status(&self) -> &'static str {
+        if self.disabled {
+            "Disabled"
+        } else if self
+            .startup
+            .as_ref()
+            .is_some_and(|s| matches!(s.kind, StartupKind::Bundled(_)))
+        {
+            "See Settings"
+        } else {
+            "Enabled"
+        }
+    }
+
     pub fn id(&self) -> String {
         format!("{}/{}", self.domain, self.label)
     }
@@ -68,7 +95,11 @@ pub fn command(program: &str, args: &[&str], timeout: Duration) -> Result<String
         } else {
             output
         }),
-        Some(_) => Err(errors),
+        Some(status) => Err(if errors.trim().is_empty() {
+            format!("{program} exited with {status}: {}", output.trim())
+        } else {
+            errors.trim().into()
+        }),
         None => Err("The command timed out.".into()),
     }
 }
@@ -105,11 +136,16 @@ pub fn disabled(text: &str) -> HashMap<String, bool> {
     text.lines()
         .filter_map(|l| {
             let (k, v) = l.split_once("=>")?;
-            Some((k.trim().trim_matches('"').into(), v.contains("true")))
+            let disabled = match v.trim() {
+                "true" | "disabled" => true,
+                "false" | "enabled" => false,
+                _ => return None,
+            };
+            Some((k.trim().trim_matches('"').into(), disabled))
         })
         .collect()
 }
-pub fn scan() -> Vec<Service> {
+pub fn scan(startup: bool) -> Vec<Service> {
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     let user = jobs(&launch(&["list"]).unwrap_or_default());
     let system = jobs(&launch(&["print", "system"]).unwrap_or_default());
@@ -153,13 +189,17 @@ pub fn scan() -> Vec<Service> {
                 .unwrap_or("–");
             let j = if dom == "system" { &system } else { &user };
             let ov = if dom == "system" { &sd } else { &ud };
-            let mutable = folder == local
+            let agent = dom == domain
+                && !folder.starts_with("/System/")
+                && !label.is_empty()
                 && !label.starts_with("com.apple.")
+                && !label.contains('/');
+            let mutable = agent
+                && folder == local
                 && path
                     .canonicalize()
                     .ok()
-                    .map(|p| p.starts_with(&local))
-                    .unwrap_or(false);
+                    .is_some_and(|p| p.starts_with(&local));
             let s = Service {
                 label: label.into(),
                 program: program.into(),
@@ -178,9 +218,17 @@ pub fn scan() -> Vec<Service> {
                         .unwrap_or(false)
                 }),
                 mutable,
+                startup: if agent {
+                    Some(Startup::new(label, StartupKind::LaunchAgent))
+                } else if folder == "/Library/LaunchDaemons" && !label.starts_with("com.apple.") {
+                    Some(Startup::new(label, StartupKind::Settings("Launch daemon")))
+                } else {
+                    None
+                },
             };
-            seen.insert(s.id());
-            result.push(s);
+            if seen.insert(s.id()) {
+                result.push(s);
+            }
         }
     }
     for (dom, j, ov) in [(&*domain, &user, &ud), ("system", &system, &sd)] {
@@ -198,20 +246,63 @@ pub fn scan() -> Vec<Service> {
             }
         }
     }
+    if startup {
+        let overrides = [(&*domain, ud), ("system", sd)]
+            .into_iter()
+            .flat_map(|(domain, values)| {
+                values
+                    .into_iter()
+                    .map(move |(label, disabled)| (format!("{domain}/{label}"), disabled))
+            })
+            .collect();
+        crate::startup::discover(
+            &mut result,
+            &domain,
+            &overrides,
+            std::path::Path::new(&home),
+        );
+    }
     result.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
     result
 }
 pub fn change(s: &Service, action: &str) -> Result<String, String> {
-    let current = scan()
+    if s.startup
+        .as_ref()
+        .is_some_and(|i| i.kind == StartupKind::LoginItem)
+    {
+        return crate::startup::change_login_item(&s.path, action);
+    }
+    let current = scan(false)
         .into_iter()
         .find(|n| n.id() == s.id())
         .ok_or("The service is no longer available.")?;
-    if !current.mutable || current.path != s.path {
+    if current.path != s.path {
+        return Err("The service configuration has changed. Refresh and try again.".into());
+    }
+    if matches!(action, "enable" | "disable")
+        && current
+            .startup
+            .as_ref()
+            .is_some_and(|i| i.kind == StartupKind::LaunchAgent)
+        && s.startup
+            .as_ref()
+            .is_some_and(|i| i.kind == StartupKind::LaunchAgent)
+    {
+        if action == "enable" && crate::startup::requires_approval(&current.path) {
+            return Err("Allow this item in System Settings > General > Login Items first.".into());
+        }
+        launch(&[action, &current.id()])?;
+        let overrides = disabled(&launch(&["print-disabled", &current.domain])?);
+        return if overrides.get(&current.label) == Some(&(action == "disable")) {
+            Ok(String::new())
+        } else {
+            Err("launchd did not confirm the startup change.".into())
+        };
+    }
+    if !current.mutable {
         return Err("Only your own non-system LaunchAgents can be changed.".into());
     }
     match action {
-        "enable" => launch(&["enable", &s.id()]),
-        "disable" => launch(&["disable", &s.id()]),
         "start" => {
             if current.loaded {
                 launch(&["kickstart", &s.id()])
@@ -241,7 +332,16 @@ mod tests {
     }
     #[test]
     fn overrides() {
-        assert_eq!(disabled(" \"foo\" => true")["foo"], true)
+        let map = disabled("disabled services = {\n \"a\" => disabled\n \"b\" => enabled\n \"c\" => true\n \"d\" => false\n \"e\" => unknown\n}");
+        assert_eq!(
+            map,
+            HashMap::from([
+                ("a".into(), true),
+                ("b".into(), false),
+                ("c".into(), true),
+                ("d".into(), false),
+            ])
+        );
     }
     #[test]
     fn timeout() {

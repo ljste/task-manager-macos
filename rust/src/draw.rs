@@ -650,28 +650,33 @@ pub fn render(p: &mut Painter, s: &mut State) {
                     commands.push(("Open app", "", Action::Switch, s.current().is_some(), 100.));
                 }
                 3 => {
-                    let enable = s
+                    let item = s
                         .current()
-                        .and_then(|r| r.service)
-                        .map(|i| s.services[i].disabled)
-                        .unwrap_or(false);
-                    let mutable = s
-                        .current()
-                        .and_then(|r| r.service)
-                        .is_some_and(|i| s.services[i].mutable);
+                        .and_then(|row| row.service)
+                        .map(|i| &s.services[i]);
+                    let (title, action, icon) = if item.is_some_and(|item| item.disabled) {
+                        ("Enable", "enable", "check")
+                    } else {
+                        ("Disable", "disable", "end")
+                    };
+                    if item
+                        .and_then(|service| service.startup.as_ref())
+                        .is_none_or(|entry| entry.can_toggle())
+                    {
+                        commands.push((
+                            title,
+                            icon,
+                            Action::Service(action.into()),
+                            !s.busy && item.is_some_and(|item| item.permits(action)),
+                            92.,
+                        ));
+                    }
                     commands.push((
-                        "Enable",
-                        "check",
-                        Action::Service("enable".into()),
-                        mutable && enable,
-                        90.,
-                    ));
-                    commands.push((
-                        "Disable",
-                        "end",
-                        Action::Service("disable".into()),
-                        mutable && !enable,
-                        100.,
+                        "Open Login Items",
+                        "",
+                        Action::Option("open-services".into()),
+                        true,
+                        145.,
                     ));
                     commands.push((
                         "Properties",

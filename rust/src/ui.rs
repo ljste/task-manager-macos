@@ -1422,10 +1422,23 @@ impl Canvas {
   else if let Some(a)=value.strip_prefix("service-confirm:"){if let Some(i)=s.current().and_then(|r|r.service){let service=s.services[i].clone();let a=a.to_string();let shared=s.shared.clone();s.busy=true;std::thread::spawn(move||{let result=services::change(&service,&a);let mut q=shared.data.lock().unwrap();q.results.push_back(Delivery::Operation(result));q.scan=true;shared.wake.notify_all();drop(q);shared.notify_ui();});}}
   s.prefs.save();
  },
- Action::Service(action)=>{if let Some(i)=s.current().and_then(|r|r.service){if s.services[i].mutable{s.dialog=Some(Dialog{title:format!("{} service?",action.to_uppercase()),message:format!("{}\nThis changes your user LaunchAgent.\nThe operation can affect its running application.",s.services[i].label),ok:action.clone(),action:Action::Option(format!("service-confirm:{action}")),input:false});}}},
+ Action::Service(action) => {
+     if let Some(item) = s.current().and_then(|row| row.service).map(|i| &s.services[i]) {
+         if !s.busy && item.permits(&action) {
+             let (title, message) = if matches!(action.as_str(), "enable" | "disable") {
+                 let name = item.startup.as_ref().map_or(&item.label, |startup| &startup.name);
+                 (format!("{} startup item?", if action == "enable" { "Enable" } else { "Disable" }),
+                  format!("{name}\nThis changes what starts at login for your account."))
+             } else {
+                 (format!("{} service?", action.to_uppercase()), format!("{}\nThis changes your user LaunchAgent and can affect its running application.", item.label))
+             };
+             s.dialog = Some(Dialog { title, message, ok: action.clone(), action: Action::Option(format!("service-confirm:{action}")), input: false });
+         }
+     }
+ },
  Action::Refresh=>{let mut q=s.shared.data.lock().unwrap();q.refresh=true;q.scan=q.services_visible;s.shared.wake.notify_all();},Action::ResetHistory=>{s.history=Default::default();s.rebuild();},Action::Logical(on)=>s.prefs.logical=on,Action::Kernel=>s.prefs.kernel=!s.prefs.kernel,Action::Summary=>s.summary=!s.summary,Action::GraphOnly=>s.graph_only=!s.graph_only,
  Action::Copy=>{let text=if s.page==1{format!("{}\nCPU: {:0.1}%\nMemory: {} / {}\nLogical processors: {}",model::cstr(&s.system.raw.brand),s.system.cpu,model::bytes(s.system.used()as f64,s.prefs.binary),model::bytes(s.system.raw.ram as f64,s.prefs.binary),s.system.raw.logical)}else{s.current().map(|r|format!("{}\n{}",r.name,s.columns.iter().map(|c|format!("{}: {}",c.title,s.row_value(r,&c.key))).collect::<Vec<_>>().join("\n"))).unwrap_or_default()};let pb=NSPasteboard::generalPasteboard();pb.clearContents();unsafe{pb.setString_forType(&NSString::from_str(&text),NSPasteboardTypeString);}},
- Action::Properties=>{s.inspector_generation=s.inspector_generation.wrapping_add(1);let generation=s.inspector_generation;s.dialog_scroll=0.;if let Some(r)=s.current().cloned(){if let Some(process)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let message=process_details(&process);shared.deliver(Delivery::Inspector(generation,message));});}let message=if let Some(i)=r.service{let q=&s.services[i];format!("Name: {}\nStatus: {}\nDomain: {}\nProgram: {}\nConfiguration: {}",q.label,q.status(),q.domain,q.program,q.path)}else if let Some(p)=s.process(){format!("Name: {}\nPID: {}  Parent PID: {}\nUser: {}  Status: {}\nCPU: {:0.1}%  Memory: {}\nPath: {}",p.info.name,p.raw.pid,p.raw.ppid,p.info.user,p.status(),p.cpu,model::bytes(p.raw.memory as f64,s.prefs.binary),p.info.path)}else{r.name.clone()};s.dialog=Some(Dialog{title:format!("{} Properties",r.name),message,ok:"OK".into(),action:Action::None,input:false});}},
+ Action::Properties=>{s.inspector_generation=s.inspector_generation.wrapping_add(1);let generation=s.inspector_generation;s.dialog_scroll=0.;if let Some(r)=s.current().cloned(){if let Some(process)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let message=process_details(&process);shared.deliver(Delivery::Inspector(generation,message));});}let message=if let Some(i)=r.service{let q=&s.services[i];if let Some(item)=q.startup.as_ref().filter(|_|s.page==3){let control=if item.can_toggle(){"Task Manager"}else{"System Settings > General > Login Items"};format!("{}\nType: {}\nStartup: {}\nManaged in: {}\nLocation: {}",item.name,item.description(),q.startup_status(),control,q.path)}else{format!("Name: {}\nStatus: {}\nDomain: {}\nProgram: {}\nConfiguration: {}",q.label,q.status(),q.domain,q.program,q.path)}}else if let Some(p)=s.process(){format!("Name: {}\nPID: {}  Parent PID: {}\nUser: {}  Status: {}\nCPU: {:0.1}%  Memory: {}\nPath: {}",p.info.name,p.raw.pid,p.raw.ppid,p.info.user,p.status(),p.cpu,model::bytes(p.raw.memory as f64,s.prefs.binary),p.info.path)}else{r.name.clone()};s.dialog=Some(Dialog{title:format!("{} Properties",r.name),message,ok:"OK".into(),action:Action::None,input:false});}},
  Action::Reveal=>{let path=s.process().map(|p|p.info.path.clone()).or_else(||s.current().and_then(|r|r.service).map(|i|s.services[i].path.clone()));if let Some(path)=path{std::thread::spawn(move||{let _=services::command("/usr/bin/open",&["-R",&path],Duration::from_secs(5));});}},Action::SearchOnline=>{if let Some(r)=s.current(){let encoded=r.name.bytes().map(|b|if b.is_ascii_alphanumeric()||b==b'-'{(b as char).to_string()}else{format!("%{b:02X}")}).collect::<String>();open_url(&format!("https://www.bing.com/search?q={encoded}"));}},
  Action::GoDetails=>{let pid=s.process().map(|p|p.id()).or_else(||s.current().and_then(|r|r.service).and_then(|i|s.services[i].pid).and_then(|pid|s.records.iter().find(|p|p.raw.pid==pid).map(|p|p.id())));s.set_page(5);s.selected=pid;s.selected_visible();},
  Action::Switch=>{if s.page==2{if let Some(row)=s.current(){let path=row.icon.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});}}else if let Some(p)=s.process(){if !p.info.app.is_empty(){let path=p.info.app.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});if s.prefs.minimize{if let Some(w)=self.window(){w.miniaturize(None);}}}}},
@@ -1550,20 +1563,33 @@ fn row_menu(s: &State) -> Vec<MenuItem> {
     };
     if s.page == 6 || s.page == 3 {
         let service = r.service.map(|i| &s.services[i]);
-        let mutable = service.is_some_and(|s| s.mutable);
         let mut v = vec![];
         for (t, a) in if s.page == 3 {
-            vec![("Enable", "enable"), ("Disable", "disable")]
+            if service
+                .and_then(|s| s.startup.as_ref())
+                .is_some_and(|entry| entry.can_toggle())
+            {
+                vec![("Enable", "enable"), ("Disable", "disable")]
+            } else {
+                vec![]
+            }
         } else {
             vec![("Start", "start"), ("Stop", "stop"), ("Restart", "restart")]
         } {
             let mut i = MenuItem::new(t, Action::Service(a.into()));
-            i.enabled = mutable;
+            i.enabled = !s.busy && service.is_some_and(|item| item.permits(a));
             v.push(i)
         }
         v.extend([
             MenuItem::sep(),
-            MenuItem::new("Open Services", Action::Option("open-services".into())),
+            MenuItem::new(
+                if s.page == 3 {
+                    "Open Login Items"
+                } else {
+                    "Open Services"
+                },
+                Action::Option("open-services".into()),
+            ),
             MenuItem::new("Search online", Action::SearchOnline),
             MenuItem::new("Go to details", Action::GoDetails),
             MenuItem::new("Properties", Action::Properties),
@@ -1782,7 +1808,21 @@ define_class!(
             true
         }
     }
-    unsafe impl NSWindowDelegate for Delegate {}
+    unsafe impl NSWindowDelegate for Delegate {
+        #[unsafe(method(windowDidBecomeKey:))]
+        fn window_became_key(&self, _notification: &NSNotification) {
+            if let Some(canvas) = self.ivars().canvas.get() {
+                let Ok(state) = canvas.ivars().state.try_borrow() else {
+                    return;
+                };
+                if state.page == 3 && state.prefs.speed != 0 {
+                    let mut shared = state.shared.data.lock().unwrap();
+                    shared.scan = true;
+                    state.shared.wake.notify_all();
+                }
+            }
+        }
+    }
 );
 fn install_menu(canvas: &Canvas, mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);

@@ -2,6 +2,7 @@ mod draw;
 mod model;
 mod power;
 mod services;
+mod startup;
 mod state;
 mod ui;
 fn main() {

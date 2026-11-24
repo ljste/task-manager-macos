@@ -230,6 +230,7 @@ pub fn columns(page: usize) -> Vec<Column> {
             col("name", "Name", 290., false),
             col("publisher", "Publisher", 180., false),
             col("status", "Status", 110., false),
+            col("kind", "Startup type", 160., false),
             col("impact", "Startup impact", 140., false),
         ],
         4 => vec![
@@ -362,6 +363,7 @@ pub struct Shared {
     reset_sample: bool,
     pub scan: bool,
     pub services_visible: bool,
+    startup_visible: bool,
     with_threads: bool,
     pub stop: bool,
 }
@@ -479,6 +481,7 @@ impl State {
                 reset_sample: false,
                 scan: services_visible,
                 services_visible,
+                startup_visible: prefs.start == 3,
                 with_threads: matches!(prefs.start, 1 | 5),
                 stop: false,
             }),
@@ -574,10 +577,11 @@ impl State {
         {
             let mut shared = self.shared.data.lock().unwrap();
             let visible = matches!(self.page, 3 | 6);
-            if visible && !shared.services_visible {
+            if visible && (!shared.services_visible || shared.startup_visible != (self.page == 3)) {
                 shared.scan = true;
             }
             shared.services_visible = visible;
+            shared.startup_visible = self.page == 3;
             let with_threads = matches!(self.page, 1 | 5);
             if with_threads && !shared.with_threads && shared.speed != 0 {
                 shared.refresh = true;
@@ -884,16 +888,17 @@ impl State {
             }
             3 | 6 => {
                 for (i, s) in self.services.iter().enumerate() {
-                    if self.page == 3
-                        && (!s.domain.starts_with("gui/")
-                            || s.path.is_empty()
-                            || s.path.starts_with("/System/")
-                            || s.label.starts_with("com.apple."))
+                    let startup = s.startup.as_ref().filter(|_| self.page == 3);
+                    if (self.page == 3 && startup.is_none())
+                        || (self.page == 6 && s.domain == "login")
                     {
                         continue;
                     }
+                    let name = startup.map_or(s.label.as_str(), |item| &item.name);
                     if ![
+                        name,
                         &s.label,
+                        &s.path,
                         &s.program,
                         &s.publisher,
                         &s.pid.unwrap_or_default().to_string(),
@@ -905,7 +910,7 @@ impl State {
                     }
                     let mut r = Row {
                         id: s.id(),
-                        name: s.label.clone(),
+                        name: name.into(),
                         service: Some(i),
                         icon: if self.page == 6 {
                             "service.item".into()
@@ -920,11 +925,7 @@ impl State {
                     r.values.insert(
                         "status".into(),
                         if self.page == 3 {
-                            if s.disabled {
-                                "Disabled"
-                            } else {
-                                "Enabled"
-                            }
+                            s.startup_status()
                         } else {
                             s.status()
                         }
@@ -934,6 +935,9 @@ impl State {
                     r.values.insert("description".into(), s.program.clone());
                     r.values.insert("group".into(), s.domain.clone());
                     r.values.insert("impact".into(), "Not measured".into());
+                    if let Some(item) = startup {
+                        r.values.insert("kind".into(), item.description().into());
+                    }
                     rows.push(r);
                 }
             }
@@ -1084,13 +1088,22 @@ pub fn workers(shared: Arc<Feed>) {
             let active = state.services_visible && state.speed != 0;
             if state.scan || (active && Instant::now() >= next) {
                 state.scan = false;
+                let startup = state.startup_visible;
                 drop(state);
-                let services = crate::services::scan();
+                let mut services = crate::services::scan(startup);
+                if !startup {
+                    for item in &mut services {
+                        item.startup = None;
+                    }
+                }
                 state = shared.data.lock().unwrap();
+                if state.startup_visible != startup && state.services_visible {
+                    continue;
+                }
                 state.services = Some(services);
                 drop(state);
                 shared.notify_ui();
-                next = Instant::now() + Duration::from_secs(15);
+                next = Instant::now() + Duration::from_secs(if startup { 60 } else { 15 });
                 state = shared.data.lock().unwrap();
             } else {
                 state = shared.wait(state, active.then_some(next));
