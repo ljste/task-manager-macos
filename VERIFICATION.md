@@ -1,20 +1,23 @@
 # Rust release verification
 
-## November 24, 2026 warmed resident memory benchmark
+## November 24, 2026 built-in Retina benchmark
 
-The shipping 2.1.0 Apple Silicon app and the immediately preceding 500 ms release ran on the same 10-core M2 Pro with 16 GiB of RAM and macOS 27.2.1 (26B131). Each fresh launch warmed for 60 seconds before 20 one-second kernel readings. The normal-level Processes window measured 1120 × 720 points, with grouping enabled and the Name column sorted ascending. Both builds ran unobstructed at 2× on a temporary extended display attached to this Mac. Other apps remained active on the built-in display. Each run recorded 61 warm-up visibility checks and 22 more around the measurement. Screen capture and profiling began after measurement.
+On a 10-core M2 Pro with 16 GiB RAM running macOS 27.2.1 (26B131), Task Manager 2.1.0 averaged **2.63% of one CPU core**, **93.56 MiB resident memory** and **30.72 MiB physical footprint** across 3 fresh launches. The previous 500 ms release used 107.40 MiB resident in one matched launch, a difference of 13.84 MiB (12.9%).
 
-| Warmed mean | Previous 500 ms release (2 launches) | Published 2.1.0 (3 launches) |
-|---|---:|---:|
-| CPU, percent of one logical core | 2.35% | 2.36% |
-| Resident memory | 97.3 MiB | 87.9 MiB |
-| Physical footprint | 61.0 MiB | 27.9 MiB |
+Both builds displayed the grouped Processes page, sorted by Name, in an 1120 × 720-point window at the default 500 ms refresh. The built-in display was set to 1512 × 982 points at 2× scale. Each launch warmed for 60 seconds before 20 one-second kernel readings. Other apps remained open. All 332 window checks used the same display, including 61 checks per warm-up and 22 around each measurement interval. The window was visible and unminimized for 332/332 checks and frontmost for 332/332 checks. The highest upper bound on overlap from other windows was 0.0%.
 
-The individual 2.1.0 trial means were 85.2, 87.8, 90.6 MiB resident and 2.46, 2.39, 2.22% CPU. The earlier 92.8 MiB resident target and original 3.05% CPU reference are documented below. A postmeasurement pixel check observed a median interval of 504 ms between changes at the 500 ms default.
+| Launch | CPU, one core | RSS (MiB) | Footprint (MiB) | Median visible update | Max overlap |
+|---|---:|---:|---:|---:|---:|
+| Previous 500 ms release | 2.60% | 107.40 | 68.60 | 508 ms | 0.0% |
+| 2.1.0 A | 2.58% | 92.71 | 31.00 | 506 ms | 0.0% |
+| 2.1.0 B | 2.56% | 95.24 | 30.60 | 503 ms | 0.0% |
+| 2.1.0 C | 2.74% | 92.72 | 30.55 | 504 ms | 0.0% |
 
-A separate run on the built-in Retina display used the same 60-second warm-up and 20 readings. Another application covered the normal-level window. Resident memory changed from 96.0 to 95.3 MiB, CPU from 2.72% to 2.06%, and footprint from 71.9 to 32.2 MiB.
+Window-only pixel captures started after each resource trial. The pooled median time between visible changes on 2.1.0 was 504 ms. Sorting by CPU and Name took 4.19 to 4.70 ms of app-side work across the 6 measured release actions, including drawing submission. The two control sorts took 1.05 and 1.13 ms.
 
-The release build passed 34 Rust tests and the shared system bridge passed the 32 Swift baseline tests. [Raw one-second readings, window checks and executable hashes](benchmarks/warm-resident-memory.json)
+The original 2-second version's archived CPU reference was 3.05%. An earlier 500 ms build supplied the separate 92.79 MiB warmed RSS target. The release mean was 0.77 MiB above the target, with 2 of 3 trial means below it. The sections below preserve those earlier test setups. A separate early native-menu experiment averaged 94.15 MiB resident and 2.48% CPU in 3 launches. Deferring creation of the Run text field averaged 94.67 MiB and 2.26% CPU across three foreground launches. A separate launch with mixed window coverage measured 90.29 MiB.
+
+The release passed 34 Rust tests, and the shared system bridge passed 32 Swift baseline tests. On-screen checks covered all eight pages, sorting, expanding groups, editing search and Run new task, viewing process Properties, pause and manual refresh, resizing, minimizing and restoring. Settings switched the window from normal level 0 to floating level 3 and back to level 0. The window recorder exported 19 full-resolution frames. Forced allocation failures for a table cell and the sidebar each exercised native drawing fallback, and the app continued responding to actions. [Raw readings, visibility checks, frame-change timestamps and executable hashes](benchmarks/warm-resident-memory.json)
 
 ## November 24, 2026 efficiency benchmark
 

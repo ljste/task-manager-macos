@@ -34,7 +34,13 @@ static CGImageRef create_view_image(NSView *view, NSRect area, CGFloat scale, TM
     return image;
 }
 
-bool tm_paint_view_bitmap(NSView *view, NSRect dirty, TMViewPaint paint) {
+void tm_clear_bitmap_regions(NSView *view) {
+    NSMutableDictionary<NSValue *, CALayer *> *layers = objc_getAssociatedObject(view, &tableLayersKey);
+    for (CALayer *tile in layers.allValues) [tile removeFromSuperlayer];
+    [layers removeAllObjects];
+}
+
+static bool paint_bitmap(NSView *view, NSRect dirty, TMViewPaint paint, bool behind_subviews) {
     NSRect area = NSIntersectionRect(dirty, view.bounds);
     if (NSIsEmptyRect(area)) return true;
     CALayer *base = view.layer;
@@ -51,8 +57,7 @@ bool tm_paint_view_bitmap(NSView *view, NSRect dirty, TMViewPaint paint) {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     if (full) {
-        for (CALayer *tile in layers.allValues) [tile removeFromSuperlayer];
-        [layers removeAllObjects];
+        tm_clear_bitmap_regions(view);
     } else {
         if (!layers) {
             layers = [NSMutableDictionary dictionary];
@@ -64,7 +69,8 @@ bool tm_paint_view_bitmap(NSView *view, NSRect dirty, TMViewPaint paint) {
             destination = [CALayer layer];
             destination.opaque = YES;
             destination.frame = [view convertRectToLayer:pixels];
-            [base addSublayer:destination];
+            if (behind_subviews) [base insertSublayer:destination atIndex:0];
+            else [base addSublayer:destination];
             layers[key] = destination;
         }
     }
@@ -73,4 +79,20 @@ bool tm_paint_view_bitmap(NSView *view, NSRect dirty, TMViewPaint paint) {
     [CATransaction commit];
     CGImageRelease(image);
     return true;
+}
+
+bool tm_paint_view_bitmap(NSView *view, NSRect dirty, TMViewPaint paint) {
+    return paint_bitmap(view, dirty, paint, false);
+}
+
+bool tm_paint_around_table(NSView *view, NSRect table, TMViewPaint paint) {
+    NSRect bounds = view.bounds;
+    NSRect header = NSMakeRect(NSMinX(bounds), NSMinY(bounds), NSWidth(bounds), NSMinY(table) - NSMinY(bounds));
+    NSRect sidebar = NSMakeRect(NSMinX(bounds), NSMinY(table), NSMinX(table) - NSMinX(bounds), NSHeight(table));
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    bool complete = paint_bitmap(view, header, paint, true) && paint_bitmap(view, sidebar, paint, true);
+    if (complete) view.layer.contents = nil;
+    [CATransaction commit];
+    return complete;
 }

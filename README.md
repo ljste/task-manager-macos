@@ -64,7 +64,7 @@ Sampling and service discovery run on independent workers. Each delivery wakes t
 
 ## Performance and verification
 
-With the Processes window visible at the default 500 ms refresh, version 2.1.0 averaged **87.9 MiB resident memory**, **27.9 MiB physical footprint** and **2.36% of one CPU core** in 3 warmed launches on an M2 Pro. [Benchmark conditions and readings](VERIFICATION.md)
+On the built-in Retina display of an M2 Pro, Task Manager 2.1.0 averaged **2.63% of one CPU core**, **93.56 MiB resident memory** and **30.72 MiB physical footprint** across 3 warmed launches of the Processes page at the default 500 ms refresh. The previous 500 ms release used 107.40 MiB resident in one matched launch. [Benchmark conditions and per-trial readings](VERIFICATION.md)
 
 The response target is **8 ms of app-side work per interaction**. Timings include the shared action handler and synchronous drawing submission; they do **not** measure display scanout, macOS scheduling, or input-to-photon latency. See [VERIFICATION.md](VERIFICATION.md) for measured results and limitations. A Rust rewrite alone is not proof of a universal 8 ms bound.
 

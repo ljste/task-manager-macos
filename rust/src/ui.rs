@@ -23,6 +23,12 @@ use std::{
     time::{Duration, Instant},
 };
 extern "C" {
+    fn tm_clear_bitmap_regions(view: &NSView);
+    fn tm_paint_around_table(
+        view: &NSView,
+        table: NSRect,
+        paint: unsafe extern "C" fn(&NSView, NSRect),
+    ) -> bool;
     fn tm_paint_view_bitmap(
         view: &NSView,
         area: NSRect,
@@ -61,7 +67,16 @@ define_class!(
 
   #[unsafe(method(updateLayer))]
   fn update_layer(&self) {
-      if !unsafe { tm_paint_view_bitmap(self, self.bounds(), paint_canvas_bitmap) } {
+      let covered = self.ivars().live_table.borrow().as_ref()
+          .filter(|table| table.ivars().has_base.get() && self.ivars().recording.borrow().is_none())
+          .map(|table| table.frame());
+      let success = unsafe {
+          match covered {
+              Some(table) => tm_paint_around_table(self, table, paint_canvas_bitmap),
+              None => tm_paint_view_bitmap(self, self.bounds(), paint_canvas_bitmap),
+          }
+      };
+      if !success {
           self.request_native_redraw();
       }
   }
@@ -147,6 +162,7 @@ unsafe extern "C" fn paint_canvas_bitmap(view: &NSView, area: NSRect) {
 
 #[derive(Default)]
 struct TableDamage {
+    has_base: Cell<bool>,
     pending: RefCell<Vec<NSRect>>,
 }
 
@@ -197,6 +213,10 @@ define_class!(
                 if !unsafe { tm_paint_view_bitmap(self, area, paint_table_surface) } {
                     canvas.request_native_redraw();
                     return;
+                }
+                if area == self.bounds() && !self.ivars().has_base.replace(true)
+                    && canvas.ivars().recording.borrow().is_none() {
+                    canvas.setNeedsDisplay(true);
                 }
             }
             model::push_history(&mut canvas.ivars().state.borrow_mut().redraw_ms,
@@ -755,6 +775,11 @@ impl Canvas {
     fn discard_table(&self) {
         let table = self.ivars().live_table.borrow_mut().take();
         if let Some(table) = table {
+            if table.ivars().has_base.get() {
+                unsafe {
+                    tm_clear_bitmap_regions(self);
+                }
+            }
             table.removeFromSuperview();
         }
     }
@@ -2077,6 +2102,7 @@ impl Canvas {
     fn toggle_recording(&self) {
         if self.ivars().recording.borrow().is_some() {
             self.ivars().recording.borrow_mut().take();
+            self.invalidate_canvas();
             return;
         }
         let Ok(path) = std::fs::read_to_string(support().join("demo-export-path.txt")) else {
@@ -2102,6 +2128,7 @@ impl Canvas {
             count: 0,
             writer: tx,
         });
+        self.invalidate_canvas();
         self.start_aux_timer();
     }
     fn record_frame(&self) {

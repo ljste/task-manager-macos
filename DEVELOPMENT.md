@@ -1,6 +1,8 @@
 # Development and measurement
 
-`./test.sh` runs Rust unit/regression tests, including a live sampler and a disposable process identity/termination test. `./build.sh` builds the release app. The Rust and Swift builds share the C system bridge. The Rust UI uses Core Graphics to draw the Processes and Users tables at the window’s backing scale. Sorting replaces the table image. Between sorts, changed headings and cells receive small images at their own coordinates. A full table update releases those images. AppKit handles drawing if a bitmap allocation fails. Image I/O decodes application icons at their display size.
+`./test.sh` runs Rust unit/regression tests, including a live sampler and a disposable process identity/termination test. `./build.sh` builds the release app. The Rust and Swift builds share the C system bridge.
+
+The Rust UI draws the Processes and Users tables at the window’s backing scale with Core Graphics. Once the table has a complete image, the window keeps separate images for the toolbar and sidebar and releases the full-window image. Sorting replaces the table image. Between sorts, changed headings and cells receive small images at their own coordinates. A full table update releases those images. AppKit handles drawing if a bitmap allocation fails. Image I/O decodes application icons at their display size.
 
 The app writes bounded timing observations to `~/Library/Application Support/TaskManager/rust-timings.json` approximately every 30 seconds. Restart to begin a new interaction buffer. Entries named `paint:<action>` include action handling, synchronous view drawing submission, and the accessibility notification. Plain action entries omit drawing. These measurements exclude input delivery and display scanout; they cannot establish input-to-photon latency.
 
