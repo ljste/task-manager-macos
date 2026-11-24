@@ -413,15 +413,15 @@ final class PerformanceView: NSView {
       hardware.stringValue = cString(raw.cpu_brand)
       pairs = [
         ("Utilization", String(format: "%.0f%%", s.cpu)),
-        ("Speed", "—"),
+        ("Speed", "–"),
         ("Processes", "\(processes.count)"),
         ("Threads", "\(processes.reduce(0){$0+Int($1.threads)})"),
-        ("Handles", "—"),
+        ("Handles", "–"),
         (
           "Up time",
           "\(Int(raw.uptime)/86400):" + duration(raw.uptime.truncatingRemainder(dividingBy: 86400))
         ),
-        ("Base speed:", "—"),
+        ("Base speed:", "–"),
         ("Cores:", "\(raw.physical)"),
         ("Logical processors:", "\(raw.logical)"),
         (
@@ -455,7 +455,7 @@ final class PerformanceView: NSView {
         "In use = active + wired + compressor pages. Available = physical RAM − in use. These are VM estimates; purgeable and cached categories overlap. Process tables show RSS, which can double-count shared pages."
     case .disk:
       hardware.stringValue = cString(raw.device)
-      upper.stringValue = "Read — solid    Write — dashed"
+      upper.stringValue = "Read – solid    Write – dashed"
       graph.second = history.map { ($0.timestamp.timeIntervalSince1970, $0.write) }
       graph.maxValue = max(1024, (history.map { max($0.read, $0.write) }.max() ?? 0) * 1.15)
       limit.stringValue = bytes(graph.maxValue) + "/s"
@@ -474,7 +474,7 @@ final class PerformanceView: NSView {
         "Throughput sums IOKit block-storage counters where drivers publish them. Capacity describes the data volume; APFS volumes share container space. Active time is not inferred from throughput."
     case .network:
       hardware.stringValue = "Physical interfaces"
-      upper.stringValue = "Receive — solid    Send — dashed"
+      upper.stringValue = "Receive – solid    Send – dashed"
       graph.second = history.map { ($0.timestamp.timeIntervalSince1970, $0.sent) }
       graph.maxValue = max(1024, (history.map { max($0.received, $0.sent) }.max() ?? 0) * 1.15)
       limit.stringValue = bytes(graph.maxValue) + "/s"
@@ -496,7 +496,7 @@ final class PerformanceView: NSView {
         ("Unified memory", gpu?.hasUnifiedMemory == true ? "Yes" : "No"),
         (
           "Recommended working set",
-          gpu.map { bytes(Double($0.recommendedMaxWorkingSetSize)) } ?? "—"
+          gpu.map { bytes(Double($0.recommendedMaxWorkingSetSize)) } ?? "–"
         ), ("Per-process GPU", "Not exposed"), ("GPU engines", "Not exposed"),
         ("Telemetry API", "Metal device capabilities"),
       ]

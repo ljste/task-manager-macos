@@ -23,7 +23,7 @@ public struct ProcessRecord: Identifiable, Codable {
     nice: Int32 = 0
   public var start: UInt64 = 0, startMicro: UInt64 = 0, cpuNS: UInt64 = 0, memory: UInt64 = 0,
     readBytes: UInt64 = 0, writeBytes: UInt64 = 0
-  public var name = "", path = "", user = "", architecture = "—", bundleID = "", appPath = "",
+  public var name = "", path = "", user = "", architecture = "–", bundleID = "", appPath = "",
     appName = ""
   public var cpu: Double = 0, diskRead: Double = 0, diskWrite: Double = 0
   public var metricsValid = false, ioValid = false
@@ -44,7 +44,7 @@ public struct ProcessRecord: Identifiable, Codable {
     ppid = p.ppid
     uid = p.uid
     state = p.state
-    threads = p.threads
+    threads = max(0, p.threads)
     nice = p.nice_value
     start = p.start_sec
     startMicro = p.start_usec
@@ -57,7 +57,7 @@ public struct ProcessRecord: Identifiable, Codable {
     user = cString(p.user)
     metricsValid = p.metrics_valid != 0
     ioValid = p.io_valid != 0
-    architecture = p.arch == 0x0100_000c ? "Apple" : (p.arch == 0x0100_0007 ? "Intel" : "—")
+    architecture = p.arch == 0x0100_000c ? "Apple" : (p.arch == 0x0100_0007 ? "Intel" : "–")
     if let range = path.range(of: ".app/") { appPath = String(path[..<range.lowerBound]) + ".app" }
   }
   public func matches(_ query: String) -> Bool {

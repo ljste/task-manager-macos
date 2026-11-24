@@ -1,4 +1,4 @@
-# Windows 11 parity status — Rust edition
+# Windows 11 parity status, Rust edition
 
 The [reference list](VISUAL_REFERENCES.md) identifies the Windows screenshots used. The goal is close visual and interaction parity with real macOS data. It is not a certification of exact pixel identity.
 

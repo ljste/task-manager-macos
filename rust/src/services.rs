@@ -150,7 +150,7 @@ pub fn scan() -> Vec<Service> {
                         .and_then(|a| a.first())
                         .and_then(|v| v.as_string())
                 })
-                .unwrap_or("—");
+                .unwrap_or("–");
             let j = if dom == "system" { &system } else { &user };
             let ov = if dom == "system" { &sd } else { &ud };
             let mutable = folder == local

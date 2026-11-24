@@ -2,8 +2,8 @@ use crate::{model::*, services::Service};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
-    time::Instant,
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
+    time::{Duration, Instant},
 };
 pub const PAGES: [&str; 8] = [
     "Processes",
@@ -79,6 +79,15 @@ impl Preferences {
         }
     }
 }
+pub fn refresh_interval(speed: u64) -> Option<Duration> {
+    match speed {
+        0 => None,
+        1 => Some(Duration::from_millis(250)),
+        4 => Some(Duration::from_secs(4)),
+        _ => Some(Duration::from_millis(500)),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     None,
@@ -258,12 +267,56 @@ pub fn columns(page: usize) -> Vec<Column> {
         _ => vec![],
     }
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RowMetrics {
+    pub cpu: Option<f64>,
+    pub memory: Option<f64>,
+    pub disk: Option<f64>,
+    pub threads: Option<f64>,
+    pub time: Option<f64>,
+    pub pid: Option<f64>,
+}
+
+impl RowMetrics {
+    fn for_processes(records: &[Process], members: &[usize]) -> Self {
+        let mut valid = false;
+        let mut io_valid = false;
+        let mut threads_known = false;
+        let (mut cpu, mut memory, mut disk, mut threads, mut time) = (0., 0., 0., 0., 0.);
+        for &i in members {
+            let process = &records[i];
+            if process.raw.valid != 0 {
+                valid = true;
+                cpu += process.cpu;
+                memory += process.raw.memory as f64;
+                time += process.raw.cpu_ns as f64 / 1e9;
+                if process.raw.threads >= 0 {
+                    threads_known = true;
+                    threads += f64::from(process.raw.threads);
+                }
+            }
+            if process.raw.io_valid != 0 {
+                io_valid = true;
+                disk += process.read + process.write;
+            }
+        }
+        Self {
+            cpu: valid.then_some(cpu),
+            memory: valid.then_some(memory),
+            disk: io_valid.then_some(disk),
+            threads: threads_known.then_some(threads),
+            time: valid.then_some(time),
+            pid: Some(f64::from(records[members[0]].raw.pid)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
     pub id: String,
     pub name: String,
     pub values: HashMap<String, String>,
-    pub numbers: HashMap<String, f64>,
+    pub metrics: RowMetrics,
     pub members: Vec<usize>,
     pub service: Option<usize>,
     pub icon: String,
@@ -280,6 +333,13 @@ impl Row {
             ..Default::default()
         }
     }
+}
+pub fn vertical_scroll_thumb(viewport: f64, max: f64, offset: f64) -> Option<(f64, f64)> {
+    if max <= 0. {
+        return None;
+    }
+    let height = (viewport / (viewport + max) * viewport).max(28.);
+    Some((offset / max * (viewport - height), height))
 }
 pub struct Dialog {
     pub title: String,
@@ -299,9 +359,66 @@ pub struct Shared {
     pub results: VecDeque<Delivery>,
     pub speed: u64,
     pub refresh: bool,
+    reset_sample: bool,
     pub scan: bool,
+    pub services_visible: bool,
+    with_threads: bool,
     pub stop: bool,
 }
+pub struct Feed {
+    pub data: Mutex<Shared>,
+    pub wake: Condvar,
+    pub on_delivery: OnceLock<Box<dyn Fn() + Send + Sync>>,
+}
+
+impl Feed {
+    fn wait<'a>(
+        &self,
+        state: MutexGuard<'a, Shared>,
+        until: Option<Instant>,
+    ) -> MutexGuard<'a, Shared> {
+        match until {
+            Some(until) => {
+                self.wake
+                    .wait_timeout(state, until.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                    .0
+            }
+            None => self.wake.wait(state).unwrap(),
+        }
+    }
+
+    pub fn notify_ui(&self) {
+        if let Some(notify) = self.on_delivery.get() {
+            notify();
+        }
+    }
+
+    pub fn deliver(&self, result: Delivery) {
+        self.data.lock().unwrap().results.push_back(result);
+        self.notify_ui();
+    }
+
+    pub fn set_speed(&self, speed: u64) {
+        let mut state = self.data.lock().unwrap();
+        if state.speed == speed {
+            return;
+        }
+        if (state.speed == 0) != (speed == 0) {
+            state.reset_sample = speed != 0;
+            state.refresh = speed != 0;
+            state.latest = None;
+        }
+        state.speed = speed;
+        self.wake.notify_all();
+    }
+
+    pub fn stop(&self) {
+        self.data.lock().unwrap().stop = true;
+        self.wake.notify_all();
+    }
+}
+
 pub struct State {
     pub prefs: Preferences,
     pub page: usize,
@@ -311,7 +428,7 @@ pub struct State {
     pub system: Snapshot,
     pub services: Vec<Service>,
     pub history: HistoryStore,
-    pub samples: VecDeque<Snapshot>,
+    pub samples: VecDeque<GraphSample>,
     pub rows: Vec<Row>,
     pub columns: Vec<Column>,
     pub expanded: HashSet<String>,
@@ -333,10 +450,9 @@ pub struct State {
     pub graph_only: bool,
     pub summary: bool,
     pub memory_percent: bool,
-    pub power_on: bool,
     pub login_enabled: bool,
     pub busy: bool,
-    pub shared: Arc<Mutex<Shared>>,
+    pub shared: Arc<Feed>,
     pub width: f64,
     pub height: f64,
     pub settings_height: f64,
@@ -352,15 +468,24 @@ impl State {
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or_default();
-        let shared = Arc::new(Mutex::new(Shared {
-            latest: None,
-            services: None,
-            results: VecDeque::new(),
-            speed: prefs.speed,
-            refresh: true,
-            scan: true,
-            stop: false,
-        }));
+        let services_visible = matches!(prefs.start, 3 | 6);
+        let shared = Arc::new(Feed {
+            data: Mutex::new(Shared {
+                latest: None,
+                services: None,
+                results: VecDeque::new(),
+                speed: prefs.speed,
+                refresh: true,
+                reset_sample: false,
+                scan: services_visible,
+                services_visible,
+                with_threads: matches!(prefs.start, 1 | 5),
+                stop: false,
+            }),
+            wake: Condvar::new(),
+            on_delivery: OnceLock::new(),
+        });
+        let details = prefs.start == 5;
         let mut s = Self {
             page: prefs.start.min(7),
             prefs,
@@ -378,8 +503,8 @@ impl State {
             selected: None,
             selections: HashSet::new(),
             query: String::new(),
-            sort: "cpu".into(),
-            ascending: false,
+            sort: if details { "cpu" } else { "name" }.into(),
+            ascending: !details,
             scroll: 0.,
             hscroll: 0.,
             hits: vec![],
@@ -392,7 +517,6 @@ impl State {
             graph_only: false,
             summary: false,
             memory_percent: false,
-            power_on: false,
             login_enabled: false,
             busy: false,
             shared,
@@ -447,8 +571,23 @@ impl State {
     }
     pub fn set_page(&mut self, n: usize) {
         self.page = n.min(7);
-        self.sort = if [0, 5].contains(&n) { "cpu" } else { "name" }.into();
-        self.ascending = ![0, 5].contains(&n);
+        {
+            let mut shared = self.shared.data.lock().unwrap();
+            let visible = matches!(self.page, 3 | 6);
+            if visible && !shared.services_visible {
+                shared.scan = true;
+            }
+            shared.services_visible = visible;
+            let with_threads = matches!(self.page, 1 | 5);
+            if with_threads && !shared.with_threads && shared.speed != 0 {
+                shared.refresh = true;
+                shared.latest = None;
+            }
+            shared.with_threads = with_threads;
+            self.shared.wake.notify_all();
+        }
+        self.sort = if n == 5 { "cpu" } else { "name" }.into();
+        self.ascending = n != 5;
         self.selected = None;
         self.selections.clear();
         self.scroll = 0.;
@@ -478,8 +617,18 @@ impl State {
             .collect()
     }
     pub fn can_end(&self) -> bool {
-        let selected = self.selected_processes();
-        !selected.is_empty() && self.page != 4 && selected.iter().all(|p| !p.protected())
+        if self.page == 4 || (self.selected.is_none() && self.selections.is_empty()) {
+            return false;
+        }
+        let mut selected = self
+            .rows
+            .iter()
+            .filter(|row| {
+                self.selected.as_ref() == Some(&row.id) || self.selections.contains(&row.id)
+            })
+            .flat_map(|row| row.members.iter())
+            .peekable();
+        selected.peek().is_some() && selected.all(|&i| !self.records[i].protected())
     }
     pub fn row_height(&self) -> f64 {
         if [5, 6, 3, 2].contains(&self.page) {
@@ -498,6 +647,23 @@ impl State {
     pub fn table_top(&self) -> f64 {
         96. + self.header_height() + if self.page == 2 { 46. } else { 0. }
     }
+    pub fn visible_rows(&self) -> std::ops::Range<usize> {
+        let height = self.row_height();
+        let first = (self.scroll / height).floor() as usize;
+        let count = ((self.height - self.table_top()) / height).ceil() as usize + 1;
+        first.min(self.rows.len())..(first + count).min(self.rows.len())
+    }
+
+    pub fn metrics_left(&self) -> f64 {
+        let names: f64 = self
+            .columns
+            .iter()
+            .take_while(|c| !c.numeric)
+            .map(|c| c.width)
+            .sum();
+        (self.sidebar() - self.hscroll + names).clamp(self.sidebar(), self.width)
+    }
+
     pub fn max_scroll(&self) -> f64 {
         if self.page == 7 {
             return (self.settings_height - self.height).max(0.);
@@ -515,86 +681,76 @@ impl State {
     fn process_row(&self, members: Vec<usize>, id: String, name: String, group: bool) -> Row {
         let first = &self.records[members[0]];
         let mut r = Row {
-            id,
             name,
             group,
-            icon: if first.app.is_empty() {
-                first.path.clone()
+            icon: if id.ends_with(".app") {
+                id.clone()
             } else {
-                first.app.clone()
+                first.info.app.clone()
             },
-            values: HashMap::with_capacity(self.columns.len()),
-            numbers: HashMap::with_capacity(9),
+            id,
             ..Default::default()
         };
-        let (mut valid, mut io, mut cpu, mut mem, mut disk, mut threads, mut time) =
-            (false, false, 0., 0., 0., 0., 0.);
-        for &i in &members {
-            let p = &self.records[i];
-            valid |= p.raw.valid != 0;
-            io |= p.raw.io_valid != 0;
-            cpu += p.cpu;
-            mem += p.raw.memory as f64;
-            disk += p.read + p.write;
-            threads += p.raw.threads as f64;
-            time += p.raw.cpu_ns as f64 / 1e9;
-        }
-        for (key, value) in [
-            ("pid", first.raw.pid as f64),
-            ("nice", first.raw.nice as f64),
-            ("ppid", first.raw.ppid as f64),
-            ("start", first.raw.start as f64),
-        ] {
-            r.numbers.insert(key.into(), value);
-        }
-        if valid {
-            for (key, value) in [
-                ("cpu", cpu),
-                ("memory", mem),
-                ("threads", threads),
-                ("time", time),
-            ] {
-                r.numbers.insert(key.into(), value);
-            }
-        }
-        if io {
-            r.numbers.insert("disk".into(), disk);
-        }
-        // Keep sortable text only; numerical strings are formatted for visible cells on demand.
-        for column in &self.columns {
-            let value = match column.key.as_str() {
-                "status" => {
-                    if self.page == 5 {
-                        first.status().into()
-                    } else if first.raw.state == 4 {
-                        "Suspended".into()
-                    } else {
-                        String::new()
-                    }
-                }
-                "user" => first.user.clone(),
-                "description" => first.title.clone(),
-                "path" => first.path.clone(),
-                "bundle" => first.bundle.clone(),
-                "arch" => match first.raw.arch {
-                    0x0100000c => "ARM64",
-                    0x01000007 => "x64",
-                    _ => "—",
-                }
-                .into(),
-                _ => continue,
-            };
-            r.values.insert(column.key.clone(), value);
+        r.metrics = RowMetrics::for_processes(&self.records, &members);
+        if first.raw.state == 4 && matches!(self.page, 0 | 4) {
+            r.values.insert("status".into(), "Suspended".into());
         }
         r.members = members;
         r
     }
-    pub fn row_value<'a>(&self, row: &'a Row, key: &str) -> std::borrow::Cow<'a, str> {
-        if let Some(value) = row.values.get(key) {
-            return std::borrow::Cow::Borrowed(value);
+
+    pub fn number(&self, row: &Row, key: &str) -> Option<f64> {
+        match key {
+            "pid" => row.metrics.pid,
+            "cpu" => row.metrics.cpu,
+            "memory" => row.metrics.memory,
+            "disk" => row.metrics.disk,
+            "time" => row.metrics.time,
+            "threads" => row.metrics.threads,
+            "ppid" | "start" | "nice" => {
+                let raw = &self.records[*row.members.first()?].raw;
+                Some(match key {
+                    "ppid" => f64::from(raw.ppid),
+                    "nice" => f64::from(raw.nice),
+                    _ => raw.start as f64,
+                })
+            }
+            _ => None,
         }
-        let Some(&number) = row.numbers.get(key) else {
-            return std::borrow::Cow::Borrowed("—");
+    }
+
+    fn row_text<'a>(&'a self, row: &'a Row, key: &str) -> Option<&'a str> {
+        if key == "name" {
+            return Some(&row.name);
+        }
+        if let Some(value) = row.values.get(key) {
+            return Some(value);
+        }
+        let first = &self.records[*row.members.first()?];
+        match key {
+            "status" => Some(if self.page == 5 {
+                first.status()
+            } else if first.raw.state == 4 {
+                "Suspended"
+            } else {
+                ""
+            }),
+            "user" => Some(&first.info.user),
+            "description" => Some(&first.info.title),
+            "path" => Some(&first.info.path),
+            "bundle" => Some(&first.info.bundle),
+            "arch" => match first.raw.arch {
+                0x0100000c => Some("ARM64"),
+                0x01000007 => Some("x64"),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn row_value<'a>(&'a self, row: &'a Row, key: &str) -> std::borrow::Cow<'a, str> {
+        let Some(number) = self.number(row, key) else {
+            return std::borrow::Cow::Borrowed(self.row_text(row, key).unwrap_or("–"));
         };
         std::borrow::Cow::Owned(match key {
             "cpu" => format!("{number:0.1}%"),
@@ -610,6 +766,70 @@ impl State {
             _ => format!("{number:0.0}"),
         })
     }
+    fn compare_rows(&self, a: &Row, b: &Row) -> std::cmp::Ordering {
+        let key = &self.sort;
+        let order = match (self.number(a, key), self.number(b, key)) {
+            (Some(a), Some(b)) => a.total_cmp(&b),
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            _ => {
+                let a = self.row_text(a, key).unwrap_or_default();
+                let b = self.row_text(b, key).unwrap_or_default();
+                if a.is_ascii() && b.is_ascii() {
+                    a.bytes()
+                        .map(|c| c.to_ascii_lowercase())
+                        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+                } else {
+                    a.to_lowercase().cmp(&b.to_lowercase())
+                }
+            }
+        };
+        (if self.ascending {
+            order
+        } else {
+            order.reverse()
+        })
+        .then_with(|| a.id.cmp(&b.id))
+    }
+
+    /// Installs the new snapshot. Returns true when its process rows are already up to date.
+    pub fn replace_processes(&mut self, records: Vec<Process>, regular_apps_changed: bool) -> bool {
+        let reusable = matches!(self.page, 0 | 4 | 5)
+            && !regular_apps_changed
+            && records.len() == self.records.len()
+            && records.iter().zip(&self.records).all(|(new, old)| {
+                let a = &new.raw;
+                let b = &old.raw;
+                a.pid == b.pid
+                    && a.start == b.start
+                    && a.micro == b.micro
+                    && a.ppid == b.ppid
+                    && a.uid == b.uid
+                    && a.arch == b.arch
+                    && (a.state == 4) == (b.state == 4)
+                    && (Arc::ptr_eq(&new.info, &old.info)
+                        || (new.info.name == old.info.name
+                            && new.info.app == old.info.app
+                            && new.info.title == old.info.title
+                            && new.info.path == old.info.path
+                            && new.info.bundle == old.info.bundle
+                            && new.info.user == old.info.user))
+            });
+        self.records = records;
+        if reusable {
+            for row in self.rows.iter_mut().filter(|row| !row.members.is_empty()) {
+                row.metrics = RowMetrics::for_processes(&self.records, &row.members);
+            }
+            if matches!(
+                self.sort.as_str(),
+                "cpu" | "memory" | "disk" | "status" | "threads" | "time" | "nice"
+            ) {
+                self.sort_rows();
+            }
+        }
+        reusable
+    }
+
     pub fn rebuild(&mut self) {
         let q = self.query.trim().to_lowercase();
         let mut rows = vec![];
@@ -620,7 +840,8 @@ impl State {
                         if !members.iter().any(|&i| self.records[i].matches(&q)) {
                             continue;
                         }
-                        rows.push(self.process_row(members, key, name, true));
+                        let expandable = members.len() > 1;
+                        rows.push(self.process_row(members, key, name, expandable));
                     }
                 } else {
                     for (i, p) in self
@@ -633,9 +854,9 @@ impl State {
                             vec![i],
                             p.id(),
                             if self.page == 5 {
-                                p.name.clone()
+                                p.info.name.clone()
                             } else {
-                                p.title.clone()
+                                p.info.title.clone()
                             },
                             false,
                         ));
@@ -657,8 +878,7 @@ impl State {
                         icon: h.path.clone(),
                         ..Default::default()
                     };
-                    r.numbers.insert("time".into(), h.cpu);
-                    r.values.insert("time".into(), duration(h.cpu));
+                    r.metrics.time = Some(h.cpu);
                     rows.push(r);
                 }
             }
@@ -695,8 +915,7 @@ impl State {
                         ..Default::default()
                     };
                     if let Some(p) = s.pid {
-                        r.numbers.insert("pid".into(), p as f64);
-                        r.values.insert("pid".into(), p.to_string());
+                        r.metrics.pid = Some(f64::from(p));
                     }
                     r.values.insert(
                         "status".into(),
@@ -726,7 +945,7 @@ impl State {
                     }
                 }
                 for (uid, m) in groups {
-                    let name = self.records[m[0]].user.clone();
+                    let name = self.records[m[0]].info.user.clone();
                     if !name.to_lowercase().contains(&q) {
                         continue;
                     }
@@ -745,38 +964,14 @@ impl State {
             }
             _ => {}
         }
-        let key = &self.sort;
-        let asc = self.ascending;
-        rows.sort_by(|a, b| {
-            let av = a.numbers.get(key);
-            let bv = b.numbers.get(key);
-            let c = match (av, bv) {
-                (Some(a), Some(b)) => a.total_cmp(b),
-                (None, Some(_)) => return std::cmp::Ordering::Greater,
-                (Some(_), None) => return std::cmp::Ordering::Less,
-                _ => {
-                    let at = if key == "name" {
-                        &a.name
-                    } else {
-                        a.values.get(key).map(String::as_str).unwrap_or("")
-                    };
-                    let bt = if key == "name" {
-                        &b.name
-                    } else {
-                        b.values.get(key).map(String::as_str).unwrap_or("")
-                    };
-                    at.to_lowercase().cmp(&bt.to_lowercase())
-                }
-            };
-            let c = if asc { c } else { c.reverse() };
-            c.then_with(|| a.id.cmp(&b.id))
-        });
+        rows.sort_unstable_by(|a, b| self.compare_rows(a, b));
         if self.page == 0 && self.prefs.grouped {
             let (mut apps, mut background, mut system) = (vec![], vec![], vec![]);
+            let uid = unsafe { libc::getuid() } as i32;
             for r in rows {
                 if self.regular_apps.contains(&r.id) {
                     apps.push(r)
-                } else if self.records[r.members[0]].raw.uid == unsafe { libc::getuid() } as i32 {
+                } else if self.records[r.members[0]].raw.uid == uid {
                     background.push(r)
                 } else {
                     system.push(r)
@@ -786,42 +981,39 @@ impl State {
             for (name, group) in [
                 ("Apps", apps),
                 ("Background processes", background),
-                ("Windows processes", system),
+                ("System processes", system),
             ] {
                 if !group.is_empty() {
-                    rows.push(Row::section(&format!(
-                        "{} ({})",
-                        if name == "Windows processes" {
-                            "System processes"
-                        } else {
-                            name
-                        },
-                        group.len()
-                    )));
+                    rows.push(Row::section(&format!("{name} ({})", group.len())));
                     rows.extend(group);
                 }
             }
         }
-        let mut expanded = vec![];
-        for r in rows {
-            let open = r.group && self.expanded.contains(&r.id);
-            let m = r.members.clone();
-            expanded.push(r);
-            if open {
-                for i in m {
-                    let p = &self.records[i];
-                    let mut child = self.process_row(
-                        vec![i],
-                        format!("child:{}", p.id()),
-                        p.name.clone(),
-                        false,
-                    );
-                    child.indent = true;
-                    expanded.push(child);
+        self.rows = if self.expanded.is_empty() {
+            rows
+        } else {
+            let mut expanded = Vec::with_capacity(rows.len());
+            for row in rows {
+                let open = row.group && self.expanded.contains(&row.id);
+                expanded.push(row);
+                if open {
+                    let parent = expanded.len() - 1;
+                    for position in 0..expanded[parent].members.len() {
+                        let i = expanded[parent].members[position];
+                        let p = &self.records[i];
+                        let mut child = self.process_row(
+                            vec![i],
+                            format!("child:{}", p.id()),
+                            p.info.name.clone(),
+                            false,
+                        );
+                        child.indent = true;
+                        expanded.push(child);
+                    }
                 }
             }
-        }
-        self.rows = expanded;
+            expanded
+        };
         self.selections
             .retain(|id| self.rows.iter().any(|r| &r.id == id));
         if self
@@ -850,55 +1042,59 @@ impl State {
         }
     }
 }
-pub fn workers(shared: Arc<Mutex<Shared>>) {
-    let sample_shared = shared.clone();
+pub fn workers(shared: Arc<Feed>) {
+    let samples = shared.clone();
     std::thread::spawn(move || {
         let mut sampler = Sampler::default();
-        let mut next = Instant::now();
-        let mut paused = false;
-        loop {
-            let (speed, refresh, stop) = {
-                let mut s = sample_shared.lock().unwrap();
-                let v = (s.speed, s.refresh, s.stop);
-                s.refresh = false;
-                v
-            };
-            if stop {
-                break;
-            }
-            if speed == 0 {
-                paused = true;
-            } else if paused {
+        let mut last_start: Option<Instant> = None;
+        let mut state = samples.data.lock().unwrap();
+        while !state.stop {
+            let speed = state.speed;
+            let interval = refresh_interval(speed);
+            let next = interval.and_then(|d| last_start.map(|t| t + d));
+            if std::mem::take(&mut state.reset_sample) {
                 sampler.reset();
-                paused = false;
-                next = Instant::now();
             }
-            if refresh || (speed > 0 && Instant::now() >= next) {
-                let sample = sampler.sample();
-                sample_shared.lock().unwrap().latest = Some(sample);
-                next = Instant::now() + std::time::Duration::from_secs(speed.max(1));
+            if state.refresh || next.is_some_and(|t| Instant::now() >= t) {
+                state.refresh = false;
+                let with_threads = state.with_threads;
+                drop(state);
+                let start = Instant::now();
+                let sample = sampler.sample_with_threads(with_threads);
+                state = samples.data.lock().unwrap();
+                if state.speed == speed
+                    && !state.reset_sample
+                    && (!state.with_threads || with_threads)
+                {
+                    state.latest = Some(sample);
+                    drop(state);
+                    samples.notify_ui();
+                    state = samples.data.lock().unwrap();
+                }
+                last_start = Some(start);
+            } else {
+                state = samples.wait(state, next);
             }
-            std::thread::sleep(std::time::Duration::from_millis(40));
         }
     });
     std::thread::spawn(move || {
         let mut next = Instant::now();
-        loop {
-            let (scan, speed, stop) = {
-                let mut s = shared.lock().unwrap();
-                let v = (s.scan, s.speed, s.stop);
-                s.scan = false;
-                v
-            };
-            if stop {
-                break;
+        let mut state = shared.data.lock().unwrap();
+        while !state.stop {
+            let active = state.services_visible && state.speed != 0;
+            if state.scan || (active && Instant::now() >= next) {
+                state.scan = false;
+                drop(state);
+                let services = crate::services::scan();
+                state = shared.data.lock().unwrap();
+                state.services = Some(services);
+                drop(state);
+                shared.notify_ui();
+                next = Instant::now() + Duration::from_secs(15);
+                state = shared.data.lock().unwrap();
+            } else {
+                state = shared.wait(state, active.then_some(next));
             }
-            if scan || (speed > 0 && Instant::now() >= next) {
-                let rows = crate::services::scan();
-                shared.lock().unwrap().services = Some(rows);
-                next = Instant::now() + std::time::Duration::from_secs(15)
-            }
-            std::thread::sleep(std::time::Duration::from_millis(150));
         }
     });
 }
@@ -932,6 +1128,15 @@ impl State {
     /// Header clicks reorder the prepared rows without reformatting every metric.
     /// Preserve expansion and selection identities while keeping section headings fixed.
     pub fn sort_rows(&mut self) {
+        if !self.rows.iter().any(|row| row.indent) {
+            let mut rows = std::mem::take(&mut self.rows);
+            for section in rows.split_mut(|row| row.section) {
+                section.sort_unstable_by(|a, b| self.compare_rows(a, b));
+            }
+            self.rows = rows;
+            self.clamp_scroll();
+            return;
+        }
         let mut tops = Vec::new();
         let mut children: HashMap<String, Vec<Row>> = HashMap::new();
         let mut parent = String::new();
@@ -946,42 +1151,22 @@ impl State {
                 tops.push(row);
             }
         }
-        let key = &self.sort;
-        let asc = self.ascending;
-        tops.sort_by(|a, b| {
-            let c = match (a.numbers.get(key), b.numbers.get(key)) {
-                (Some(a), Some(b)) => a.total_cmp(b),
-                (None, Some(_)) => return std::cmp::Ordering::Greater,
-                (Some(_), None) => return std::cmp::Ordering::Less,
-                _ => {
-                    let a = if key == "name" {
-                        a.name.as_str()
-                    } else {
-                        a.values.get(key).map(String::as_str).unwrap_or("")
-                    };
-                    let b = if key == "name" {
-                        b.name.as_str()
-                    } else {
-                        b.values.get(key).map(String::as_str).unwrap_or("")
-                    };
-                    a.to_lowercase().cmp(&b.to_lowercase())
-                }
-            };
-            (if asc { c } else { c.reverse() }).then_with(|| a.id.cmp(&b.id))
-        });
+        tops.sort_unstable_by(|a, b| self.compare_rows(a, b));
         if self.page == 0 && self.prefs.grouped {
             let mut groups: [Vec<Row>; 3] = Default::default();
+            let uid = unsafe { libc::getuid() } as i32;
             for row in tops {
-                let group =
-                    if self.regular_apps.contains(&row.id) {
-                        0
-                    } else if row.members.first().is_some_and(|&i| {
-                        self.records[i].raw.uid == unsafe { libc::getuid() } as i32
-                    }) {
-                        1
-                    } else {
-                        2
-                    };
+                let group = if self.regular_apps.contains(&row.id) {
+                    0
+                } else if row
+                    .members
+                    .first()
+                    .is_some_and(|&i| self.records[i].raw.uid == uid)
+                {
+                    1
+                } else {
+                    2
+                };
                 groups[group].push(row);
             }
             for (name, group) in ["Apps", "Background processes", "System processes"]
@@ -1013,6 +1198,66 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn next_sample(feed: &Feed) -> Sample {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(sample) = feed.data.lock().unwrap().latest.take() {
+                return sample;
+            }
+            assert!(Instant::now() < deadline, "sampler did not deliver");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn operation_is_available_before_delivery_notification() {
+        let feed = State::new().shared;
+        let weak = Arc::downgrade(&feed);
+        let (sent, received) = std::sync::mpsc::channel();
+        assert!(feed
+            .on_delivery
+            .set(Box::new(move || {
+                let feed = weak.upgrade().unwrap();
+                let ready = feed.data.try_lock().unwrap().results.len();
+                sent.send(ready).unwrap();
+            }))
+            .is_ok());
+        feed.deliver(Delivery::Operation(Ok(String::new())));
+        assert_eq!(received.try_recv(), Ok(1));
+    }
+
+    #[test]
+    fn live_refresh_pause_manual_and_resume() {
+        let state = State::new();
+        let feed = &state.shared;
+        {
+            let mut shared = feed.data.lock().unwrap();
+            shared.speed = 1;
+            shared.scan = false;
+            shared.services_visible = false;
+        }
+        workers(feed.clone());
+        let first = next_sample(feed);
+        let second = next_sample(feed);
+        let interval = second.at.duration_since(first.at);
+        assert!(interval >= Duration::from_millis(245));
+        assert!(interval < Duration::from_secs(1));
+        feed.set_speed(0);
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(feed.data.lock().unwrap().latest.is_none());
+        feed.data.lock().unwrap().refresh = true;
+        feed.wake.notify_all();
+        let manual = next_sample(feed);
+        assert!(!manual.processes.is_empty());
+        assert!(manual.system.elapsed > 0.);
+        assert!(feed.data.lock().unwrap().services.is_none());
+        feed.set_speed(2);
+        let resumed = next_sample(feed);
+        assert_eq!(resumed.system.elapsed, 0.);
+        assert!(next_sample(feed).at.duration_since(resumed.at) >= Duration::from_millis(495));
+        feed.stop();
+    }
+
     #[test]
     fn every_table_column_has_sortable_identity() {
         for page in [0, 2, 3, 4, 5, 6] {
@@ -1023,6 +1268,119 @@ mod tests {
             assert!(cols.iter().all(|c| c.width >= 55.));
         }
     }
+    fn fixture_processes() -> Vec<Process> {
+        let template = Sampler::default()
+            .sample()
+            .processes
+            .into_iter()
+            .find(|p| p.raw.pid == unsafe { libc::getpid() })
+            .unwrap();
+        [
+            (10, 1, "/Applications/Editor.app"),
+            (11, 10, ""),
+            (12, 1, ""),
+        ]
+        .into_iter()
+        .map(|(pid, parent, app)| {
+            let mut process = template.clone();
+            process.raw.pid = pid;
+            process.raw.uid = 501;
+            process.raw.ppid = parent;
+            process.raw.state = 2;
+            process.raw.threads = -1;
+            process.raw.valid = 1;
+            process.raw.io_valid = 1;
+            process.cpu = f64::from(pid);
+            let info = Arc::make_mut(&mut process.info);
+            info.name = format!("process-{pid}");
+            info.path = format!("/tmp/{pid}");
+            info.app = app.into();
+            info.user = "tester".into();
+            info.title = format!("Title-{pid}");
+            process
+        })
+        .collect()
+    }
+
+    #[test]
+    fn retained_rows_match_rebuild_for_sorted_filtered_and_expanded_tables() {
+        let records = fixture_processes();
+        let mut next = records.clone();
+        next[0].cpu = 0.;
+        next[1].raw.memory += 4096;
+        next[2].cpu = 99.;
+        next[2].raw.threads = 7;
+        next[2].raw.state = 3;
+        for (page, sort, query) in [
+            (0, "name", "tester"),
+            (0, "cpu", ""),
+            (4, "memory", "tester"),
+            (5, "status", ""),
+        ] {
+            let mut state = State::new();
+            state.prefs.grouped = true;
+            state.records = records.clone();
+            state.set_page(page);
+            state.sort = sort.into();
+            state.query = query.into();
+            state.regular_apps.insert("/Applications/Editor.app".into());
+            state.expanded.insert("/Applications/Editor.app".into());
+            state
+                .expanded
+                .insert(format!("user:{}", records[0].raw.uid));
+            state.rebuild();
+            assert!(state.rows.iter().any(|r| !r.members.is_empty()));
+            let selected = state
+                .rows
+                .iter()
+                .find(|r| !r.members.is_empty())
+                .unwrap()
+                .id
+                .clone();
+            state.selections.insert(selected.clone());
+            state.selected = Some(selected.clone());
+            assert!(state.replace_processes(next.clone(), false));
+            let retained = state.rows.clone();
+            state.rebuild();
+            assert_eq!(retained, state.rows);
+            assert_eq!(state.selected.as_ref(), Some(&selected));
+            assert!(state.selections.contains(&selected));
+            assert!(state
+                .rows
+                .iter()
+                .any(|r| r.members.contains(&2) && r.metrics.threads == Some(7.)));
+            assert!(state
+                .rows
+                .iter()
+                .filter(|r| !r.members.contains(&2))
+                .all(|r| r.metrics.threads.is_none()));
+        }
+    }
+
+    #[test]
+    fn changed_membership_metadata_or_order_requires_rebuild() {
+        let records = fixture_processes();
+        let mut state = State::new();
+        state.records = records.clone();
+        state.set_page(0);
+        let mut reused = records.clone();
+        reused[0].raw.micro += 1;
+        let mut reparented = records.clone();
+        reparented[1].raw.ppid = 1;
+        let mut renamed = records.clone();
+        Arc::make_mut(&mut renamed[0].info).title = "Updated editor".into();
+        let mut reordered = records.clone();
+        reordered.swap(0, 1);
+        for next in [reused, reparented, renamed, reordered] {
+            state.records = records.clone();
+            state.rebuild();
+            assert!(!state.replace_processes(next, false));
+        }
+        state.records = records.clone();
+        state.rebuild();
+        assert!(!state.replace_processes(records, true));
+    }
+
     #[test]
     fn cached_sort_preserves_selection_and_unknown_last() {
         let mut s = State::new();
@@ -1031,13 +1389,19 @@ mod tests {
             Row {
                 id: "a".into(),
                 name: "a".into(),
-                numbers: HashMap::from([("cpu".into(), 2.)]),
+                metrics: RowMetrics {
+                    cpu: Some(2.),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             Row {
                 id: "b".into(),
                 name: "b".into(),
-                numbers: HashMap::from([("cpu".into(), 8.)]),
+                metrics: RowMetrics {
+                    cpu: Some(8.),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             Row {

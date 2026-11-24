@@ -2,7 +2,7 @@
 
 **Windows Task Manager's familiar interface. A native Rust app for your Mac.**
 
-An Ultrafast build experiment by [hotredsam](https://github.com/hotredsam). Version 2 rewrites the app in Rust with native AppKit drawing and a small C bridge to public macOS monitoring APIs. No browser, Electron, Swift runtime, or web view is involved in the Rust executable.
+This edition builds on [hotredsam’s Task Manager for macOS](https://github.com/hotredsam/task-manager-macos). It uses Rust, native AppKit drawing and a C bridge to macOS monitoring APIs.
 
 The interface follows the [Windows 11 reference screenshots](VISUAL_REFERENCES.md): right-hand window controls, eight navigation pages, grouped processes, sortable resource columns, context menus, and live performance graphs. [The component audit](COMPONENT_AUDIT.md) and [parity notes](PARITY.md) distinguish implemented behavior from remaining differences. This is an independent project, not an official Microsoft or Apple application.
 
@@ -12,25 +12,25 @@ The interface follows the [Windows 11 reference screenshots](VISUAL_REFERENCES.m
 
 Targets **M1 and later M-series Macs on macOS 14 or later**. The build uses general `arm64`, with processor counts and metrics discovered at runtime.
 
-Physically tested on a **16-inch MacBook Pro (2026), model Mac17,8, Apple M5 Pro with 18 CPU cores and 48 GB RAM**, running macOS 26.5.1. Rust 1.98.1 and Apple Command Line Tools were used. Other M-series configurations and older supported macOS releases are compatibility targets, not separately hardware-tested claims. Intel is outside this build's support target.
+The current release was benchmarked on a **10-core Apple M2 Pro with 16 GB RAM** running macOS 27.2.1. The original release was tested on a **16-inch MacBook Pro (2026), model Mac17,8, with an 18-core M5 Pro and 48 GB RAM** running macOS 26.5.1, using Rust 1.98.1 and Apple Command Line Tools. Other M-series configurations and older supported macOS releases remain compatibility targets. Intel is outside the build target.
 
 ## Download and build
 
-[Download the Apple Silicon app](https://github.com/hotredsam/task-manager-macos/releases/latest). The bundle is locally signed, not notarized; building from source is also supported.
+[Download the Apple Silicon app](https://github.com/ljste/task-manager-macos/releases/latest). Extract the ZIP and move Task Manager to Applications. The release has an ad hoc signature and has not been notarized by Apple.
 
-Install a current stable Rust toolchain, Apple Command Line Tools, and Python 3. Then:
+To build from source, install a current stable Rust toolchain, Apple Command Line Tools, and Python 3, then run these commands.
 
 ```sh
-git clone https://github.com/hotredsam/task-manager-macos.git
+git clone https://github.com/ljste/task-manager-macos.git
 cd task-manager-macos
 ./test.sh
 ./build.sh
 open "../Task Manager.app"
 ```
 
-The scripts use locked Cargo dependencies and target macOS 14. The resulting application is ad-hoc signed; it is not notarized. Move it to Applications, launch it, and choose **Options → Keep in Dock** from its Dock menu.
+The scripts use locked Cargo dependencies and target macOS 14. To pin the app to the Dock, choose **Options → Keep in Dock** from its Dock menu.
 
-The former Swift implementation remains in `Sources/` and `Tests/` as a historical baseline. `build-swift.sh` and `test-swift.sh` build/test that baseline. The main build and CI use Rust; the Rust binary links only the C `SystemBridge` source from that directory.
+The former Swift implementation remains in `Sources/` and `Tests/` as a historical baseline. `build-swift.sh` and `test-swift.sh` build/test that baseline. The main build and CI use Rust; the Rust binary shares the C `SystemBridge` source with the Swift baseline.
 
 ## Using it
 
@@ -42,6 +42,8 @@ The former Swift implementation remains in `Sources/` and `Tests/` as a historic
 - **Startup apps / Services:** inspect launchd jobs and eligible LaunchAgents. Start/stop/restart or enable/disable only applies to validated current-user, non-Apple LaunchAgents. Open Services leads to macOS Login Items & Extensions for authoritative system management.
 - **Users:** expand a user to see their processes. System service accounts are excluded. Disconnect is unavailable.
 - **Settings:** start page, update interval, pause, window behavior, grouping, history visibility, graph interval, units, theme, and launch at login. Login registration uses Apple's ServiceManagement API and may need approval in System Settings.
+
+The window uses normal macOS stacking by default. You can enable Always on top in Settings. Normal refresh updates process and system metrics every 500 ms. High updates every 250 ms. Low updates every four seconds. Paused keeps the displayed sample available, and F5 takes a fresh reading. Graphs use elapsed time across speed changes.
 
 Command-1…8 switches pages; Command-F searches; Command-N runs an application; F5 refreshes; Control-Tab cycles pages. Arrow keys navigate/expand rows, Tab moves through commands, Enter activates a focused command or opens properties, Delete requests End task, and Escape dismisses menus/dialogs. Option-Space opens the window menu; Option-F4 closes. Maximize uses the current screen's usable area and restores its previous frame.
 
@@ -58,9 +60,11 @@ Command-1…8 switches pages; Command-F searches; Command-N runs an application;
 | Services | launchctl inventory and plist metadata; bounded subprocess output/timeouts |
 | Power | ProcessInfo state plus administrator-authorized, allowlisted pmset commands and readback |
 
-Sampling and service discovery run on independent workers. The UI uses bounded, latest-only deliveries, virtualized rows, cached drawing attributes, and deferred icon loading. Open menus, confirmations, and drags keep their backing snapshot stable. History is capped at 5,000 entries; graph samples and timing buffers are bounded. Data and preferences stay in `~/Library/Application Support/TaskManager/`; the app does not upload them.
+Sampling and service discovery run on independent workers. Each delivery wakes the UI. Processes and Users reuse stable rows and repaint visible cells when their displayed values or heat colors change. Open menus, confirmations, and drags keep their backing snapshot stable. History is capped at 5,000 entries; graph samples and timing buffers are bounded. Data and preferences stay in `~/Library/Application Support/TaskManager/`; the app does not upload them.
 
 ## Performance and verification
+
+With the Processes window visible at the default 500 ms refresh, version 2.1.0 averaged **87.9 MiB resident memory**, **27.9 MiB physical footprint** and **2.36% of one CPU core** in 3 warmed launches on an M2 Pro. [Benchmark conditions and readings](VERIFICATION.md)
 
 The response target is **8 ms of app-side work per interaction**. Timings include the shared action handler and synchronous drawing submission; they do **not** measure display scanout, macOS scheduling, or input-to-photon latency. See [VERIFICATION.md](VERIFICATION.md) for measured results and limitations. A Rust rewrite alone is not proof of a universal 8 ms bound.
 

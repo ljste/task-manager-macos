@@ -1,9 +1,20 @@
 fn main() {
     cc::Build::new()
+        .file("src/CanvasBitmap.m")
+        .file("src/IconThumbnail.m")
+        .flag("-fobjc-arc")
+        .compile("canvasbitmap");
+    cc::Build::new()
         .file("../Sources/SystemBridge/SystemBridge.c")
         .include("../Sources/SystemBridge/include")
         .compile("systembridge");
     println!("cargo:rustc-link-lib=framework=IOKit");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    println!("cargo:rustc-link-lib=framework=CoreGraphics");
+    println!("cargo:rustc-link-lib=framework=QuartzCore");
+    println!("cargo:rustc-link-lib=framework=ImageIO");
+    println!("cargo:rerun-if-changed=src/IconThumbnail.m");
+    println!("cargo:rerun-if-changed=src/CanvasBitmap.m");
     println!("cargo:rerun-if-changed=../Sources/SystemBridge/SystemBridge.c");
+    println!("cargo:rerun-if-changed=../Sources/SystemBridge/include/SystemBridge.h");
 }

@@ -16,6 +16,11 @@ typedef struct {
 } TMSystem;
 typedef struct { uint32_t user, system, idle, nice; } TMCPU;
 int tm_cpu_load(TMCPU **out);
+typedef void (*TMProcessVisitor)(void *context, const TMProcess *process, const uint8_t uuid[16], uint64_t start_ticks);
+void tm_visit_processes(int with_threads, void *context, TMProcessVisitor visit);
+int tm_sample_image(const TMProcess *p, char *path, int capacity, char name[256], int *arch);
+int tm_process_image(int pid, char *path, int capacity);
+void tm_username(int uid, char *name, int capacity);
 int tm_processes(TMProcess **out);
 void tm_free(void *p);
 uint64_t tm_ticks_to_ns(uint64_t ticks);

@@ -4,7 +4,18 @@ use objc2::AnyThread;
 use objc2::{msg_send, rc::Retained};
 use objc2_app_kit::*;
 use objc2_foundation::*;
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+};
+extern "C" {
+    fn tm_icon_thumbnail(path: &NSString, pixels: usize) -> *mut NSImage;
+}
+
+fn icon_thumbnail(path: &NSString, pixels: usize) -> Option<Retained<NSImage>> {
+    unsafe { Retained::from_raw(tm_icon_thumbnail(path, pixels)) }
+}
+
 pub fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(w.max(0.), h.max(0.)))
 }
@@ -18,6 +29,9 @@ pub fn gray(v: f64) -> Retained<NSColor> {
     rgb(v, v, v)
 }
 pub struct Painter {
+    chrome: Option<Retained<NSGradient>>,
+    heat_colors: [Option<Retained<NSColor>>; 256],
+    image_order: VecDeque<String>,
     pub fonts: HashMap<(u16, bool), Retained<NSFont>>,
     pub images: HashMap<String, Retained<NSImage>>,
     pub pending_images: std::collections::VecDeque<String>,
@@ -27,6 +41,13 @@ pub struct Painter {
 impl Painter {
     pub fn new(_mtm: MainThreadMarker) -> Self {
         Self {
+            chrome: NSGradient::initWithStartingColor_endingColor(
+                NSGradient::alloc(),
+                &rgb(0.937, 0.953, 0.973),
+                &rgb(0.902, 0.953, 0.949),
+            ),
+            heat_colors: std::array::from_fn(|_| None),
+            image_order: VecDeque::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
             pending_images: std::collections::VecDeque::new(),
@@ -106,6 +127,10 @@ impl Painter {
     }
     pub fn fill(&self, r: [f64; 4], c: &NSColor, radius: f64) {
         c.setFill();
+        if radius == 0. {
+            NSBezierPath::fillRect(nsrect(r));
+            return;
+        }
         let p = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(nsrect(r), radius, radius);
         p.fill();
     }
@@ -340,6 +365,35 @@ impl Painter {
             }
         }
     }
+    fn thumbnail(image: &NSImage) -> Option<Retained<NSImage>> {
+        let bitmap = unsafe {
+            NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+                NSBitmapImageRep::alloc(), std::ptr::null_mut(), 36, 36, 8, 4, true, false, NSDeviceRGBColorSpace, 0, 0)?
+        };
+        let context = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bitmap)?;
+        NSGraphicsContext::saveGraphicsState_class();
+        NSGraphicsContext::setCurrentContext(Some(&context));
+        image.drawInRect(rect(0., 0., 36., 36.));
+        NSGraphicsContext::restoreGraphicsState_class();
+        let size = NSSize::new(18., 18.);
+        bitmap.setSize(size);
+        let icon = NSImage::initWithSize(NSImage::alloc(), size);
+        icon.addRepresentation(&bitmap);
+        Some(icon)
+    }
+
+    fn bundle_artwork(bundle_path: &Path) -> Option<Retained<NSImage>> {
+        let contents = bundle_path.join("Contents");
+        let info = plist::Value::from_file(contents.join("Info.plist")).ok()?;
+        let name = info.as_dictionary()?.get("CFBundleIconFile")?.as_string()?;
+        let name = Path::new(name).file_name()?;
+        let file = contents.join("Resources").join(name).with_extension("icns");
+        if !file.is_file() {
+            return None;
+        }
+        icon_thumbnail(&NSString::from_str(file.to_str()?), 36)
+    }
+
     pub fn load_image(&mut self, path: &str) {
         if !self.images.contains_key(path) {
             let img = if path == "appicon" {
@@ -347,13 +401,31 @@ impl Painter {
                     .resourcePath()
                     .map(|p| format!("{p}/AppIcon.icns"))
                     .unwrap_or_default();
-                NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(&p))
+                icon_thumbnail(&NSString::from_str(&p), 32)
             } else {
-                Some(NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(path)))
+                let file = NSString::from_str(path);
+                let artwork = Self::bundle_artwork(Path::new(path)).or_else(|| {
+                    let bundle = NSBundle::bundleWithPath(&file)?;
+                    let name = bundle
+                        .objectForInfoDictionaryKey(ns_string!("CFBundleIconFile"))?
+                        .downcast::<NSString>()
+                        .ok()?;
+                    let stem = name.stringByDeletingPathExtension();
+                    let icon_path =
+                        bundle.pathForResource_ofType(Some(&stem), Some(ns_string!("icns")))?;
+                    icon_thumbnail(&icon_path, 36)
+                });
+                artwork
+                    .or_else(|| Self::thumbnail(&NSWorkspace::sharedWorkspace().iconForFile(&file)))
             };
             if let Some(img) = img {
-                if self.images.len() > 2048 {
-                    self.images.clear()
+                if path != "appicon" {
+                    if self.image_order.len() >= 128 {
+                        if let Some(oldest) = self.image_order.pop_front() {
+                            self.images.remove(&oldest);
+                        }
+                    }
+                    self.image_order.push_back(path.into());
                 }
                 self.images.insert(path.into(), img);
             }
@@ -445,15 +517,11 @@ pub fn render(p: &mut Painter, s: &mut State) {
     let bg = gray(if dark { 0.09 } else { 1. });
     let rule = gray(if dark { 0.25 } else { 0.88 });
     let accent = rgb(0.0, 0.40, 0.64);
-    p.fill(
-        [0., 0., w, h],
-        &*if dark {
-            gray(0.125)
-        } else {
-            rgb(0.937, 0.961, 0.977)
-        },
-        0.,
-    );
+    if let Some(gradient) = p.chrome.as_ref().filter(|_| !dark) {
+        gradient.drawInRect_angle(rect(0., 0., w, h), 90.);
+    } else {
+        p.fill([0., 0., w, h], &gray(if dark { 0.125 } else { 0.95 }), 0.);
+    }
     if !s.graph_only {
         p.image("appicon", [52., 17., 16., 16.]);
         p.text(
@@ -518,7 +586,7 @@ pub fn render(p: &mut Painter, s: &mut State) {
                     &gray(if dark {
                         0.21
                     } else if s.page == i {
-                        0.9
+                        0.91
                     } else {
                         0.93
                     }),
@@ -546,7 +614,11 @@ pub fn render(p: &mut Painter, s: &mut State) {
         if s.page != 7 {
             p.fill(
                 [side, 48., w - side, 48.],
-                &gray(if dark { 0.145 } else { 0.98 }),
+                &*if dark {
+                    gray(0.145)
+                } else {
+                    rgb(0.971, 0.98, 0.985)
+                },
                 6.,
             );
             p.line(&[(side, 95.5), (w, 95.5)], &rule, 1.);
@@ -653,6 +725,9 @@ pub fn render(p: &mut Painter, s: &mut State) {
             let total: f64 = commands.iter().map(|v| v.4).sum();
             let mut x = (w - total - 16.).max(side + 140.);
             for (title, ic, a, en, width) in commands {
+                if a == Action::End {
+                    p.line(&[(x - 3.5, 59.), (x - 3.5, 85.)], &rule, 0.8);
+                }
                 if x + width <= w {
                     control(p, s, [x, 55., width, 34.], title, ic, a, en)
                 }
@@ -665,7 +740,7 @@ pub fn render(p: &mut Painter, s: &mut State) {
     } else if s.page == 7 {
         settings(p, s)
     } else {
-        table(p, s)
+        table(p, s, None)
     }
     if s.prefs.speed == 0 && !s.graph_only {
         p.text(
@@ -681,6 +756,7 @@ pub fn render(p: &mut Painter, s: &mut State) {
         let width = (s.width - 630.).clamp(240., 500.);
         let x = (s.width - width) / 2.;
         p.fill([x, 9., width, 31.], &gray(if dark { 0.18 } else { 1. }), 4.);
+        p.outline([x, 9., width, 31.], &rule, 0.8, 4.);
         p.line(&[(x + 3., 39.5), (x + width - 3., 39.5)], &gray(0.62), 0.8);
         if s.query.is_empty() {
             p.text(
@@ -707,7 +783,192 @@ pub fn render(p: &mut Painter, s: &mut State) {
     menus(p, s);
     dialog(p, s);
 }
-fn table(p: &mut Painter, s: &mut State) {
+pub fn metric_heading(s: &State, key: &str) -> String {
+    match key {
+        "cpu" => format!("{:.0}%", s.system.cpu),
+        "memory" => format!("{:.0}%", s.system.memory()),
+        "disk" => format!(
+            "{}/s",
+            bytes(s.system.read + s.system.write, s.prefs.binary)
+        ),
+        "network" => format!(
+            "{}/s",
+            bytes(s.system.sent + s.system.received, s.prefs.binary)
+        ),
+        _ => String::new(),
+    }
+}
+
+#[derive(PartialEq, Eq)]
+pub struct MetricCell {
+    text: String,
+    heat: Option<u8>,
+}
+
+impl MetricCell {
+    pub fn new(s: &State, row: &Row, key: &str) -> Self {
+        let scale = match key {
+            "cpu" => Some(100.),
+            "memory" => Some(s.system.raw.ram as f64),
+            "disk" => Some(s.system.read + s.system.write),
+            "network" => Some(1.),
+            _ => None,
+        };
+        let heat = scale.map(|scale| {
+            let value = s.number(row, key).unwrap_or(0.);
+            let base = if s.selected.as_ref() == Some(&row.id) || s.selections.contains(&row.id) {
+                0.37
+            } else if matches!(&s.hover, Action::Select(id) if id == &row.id) {
+                0.30
+            } else {
+                0.19
+            };
+            let alpha = base + 0.46 * (value / scale.max(1.)).clamp(0., 1.).sqrt();
+            (alpha * if s.prefs.dark { 0.65 } else { 1. } * 255.).round() as u8
+        });
+        Self {
+            text: s.row_value(row, key).into_owned(),
+            heat,
+        }
+    }
+}
+
+fn row_background(dark: bool, selected: bool, hover: bool) -> f64 {
+    match (dark, selected, hover) {
+        (true, true, _) => 0.27,
+        (true, _, true) => 0.18,
+        (true, _, _) => 0.09,
+        (false, true, _) => 0.90,
+        (false, _, true) => 0.96,
+        (false, _, _) => 1.0,
+    }
+}
+
+fn paint_value(
+    p: &mut Painter,
+    s: &State,
+    row: &Row,
+    column: &Column,
+    frame: NSRect,
+    fg: &NSColor,
+) {
+    let NSPoint { x, y } = frame.origin;
+    let value = if matches!(s.page, 0 | 4) && column.numeric {
+        let cell = MetricCell::new(s, row, &column.key);
+        if let Some(alpha) = cell.heat {
+            let color = p.heat_colors[usize::from(alpha)].get_or_insert_with(|| {
+                NSColor::colorWithSRGBRed_green_blue_alpha(
+                    0.10,
+                    0.58,
+                    0.88,
+                    f64::from(alpha) / 255.,
+                )
+            });
+            color.setFill();
+            NSBezierPath::fillRect(frame);
+        }
+        std::borrow::Cow::Owned(cell.text)
+    } else {
+        s.row_value(row, &column.key)
+    };
+    p.text(
+        &value,
+        [x + 8., y + 4., frame.size.width - 16., 22.],
+        13.,
+        false,
+        fg,
+        column.numeric,
+    );
+}
+
+fn metric_cell_at(s: &State, area: NSRect) -> Option<(&Row, &Column, NSRect)> {
+    let top = s.table_top();
+    if area.origin.y < top || area.size.height > s.row_height() {
+        return None;
+    }
+    let height = s.row_height();
+    let middle_y = area.origin.y + area.size.height / 2.;
+    let i = ((middle_y - top + s.scroll) / height).floor() as usize;
+    let row = s.rows.get(i)?;
+    if row.section {
+        return None;
+    }
+    let sidebar = s.sidebar();
+    let viewport = rect(sidebar, top, s.width - sidebar - 15., s.height - top - 15.);
+    let y = top + i as f64 * height - s.scroll;
+    let mut x = sidebar - s.hscroll;
+    for column in &s.columns {
+        let frame = rect(x, y, column.width, height);
+        if column.numeric && NSIntersectionRect(viewport, frame) == area {
+            return Some((row, column, frame));
+        }
+        x += column.width;
+    }
+    None
+}
+
+fn paint_metric_patch(p: &mut Painter, s: &State, area: NSRect) -> bool {
+    let Some((row, column, frame)) = metric_cell_at(s, area) else {
+        return false;
+    };
+    let selected = s.selected.as_ref() == Some(&row.id) || s.selections.contains(&row.id);
+    let hover = matches!(&s.hover, Action::Select(id) if id == &row.id);
+    gray(row_background(s.prefs.dark, selected, hover)).setFill();
+    NSBezierPath::fillRect(area);
+    let fg = gray(if s.prefs.dark { 0.94 } else { 0.08 });
+    paint_value(p, s, row, column, frame, &fg);
+    let edge = frame.origin.x + frame.size.width;
+    if edge <= s.width - 15. {
+        let rule = gray(if s.prefs.dark { 0.25 } else { 0.89 });
+        p.line(
+            &[(edge - 0.5, s.table_top()), (edge - 0.5, s.height - 15.)],
+            &rule,
+            0.65,
+        );
+    }
+    true
+}
+
+pub fn redraw_table(p: &mut Painter, s: &mut State, view: &NSView, dirty: NSRect) {
+    let metrics_only = matches!(s.page, 0 | 4)
+        && dirty.origin.x >= s.metrics_left()
+        && dirty.origin.x > s.sidebar()
+        && dirty.origin.x + dirty.size.width <= s.width - 15.
+        && dirty.origin.y + dirty.size.height <= s.height - 15.
+        && !s.hits.is_empty();
+    if !metrics_only {
+        s.hits.retain(|hit| {
+            !matches!(
+                hit.action,
+                Action::Sort(_)
+                    | Action::ResizeColumn(_)
+                    | Action::Select(_)
+                    | Action::Expand(_)
+                    | Action::ScrollH
+                    | Action::ScrollV
+                    | Action::ResetHistory
+            )
+        });
+    }
+    let needs = |r| view.needsToDrawRect(r);
+    paint_table_region(p, s, metrics_only.then_some(&needs), dirty);
+}
+
+pub fn paint_table_region(
+    p: &mut Painter,
+    s: &mut State,
+    damaged: Option<&dyn Fn(NSRect) -> bool>,
+    dirty: NSRect,
+) {
+    if damaged.is_some() && paint_metric_patch(p, s, dirty) {
+        return;
+    }
+    gray(if s.prefs.dark { 0.09 } else { 1. }).setFill();
+    NSBezierPath::fillRect(dirty);
+    table(p, s, damaged);
+}
+
+fn table(p: &mut Painter, s: &mut State, metrics_view: Option<&dyn Fn(NSRect) -> bool>) {
     let side = s.sidebar();
     let (w, h) = (s.width, s.height);
     let top = s.table_top();
@@ -750,7 +1011,7 @@ fn table(p: &mut Painter, s: &mut State) {
             true,
         );
     }
-    for c in s.columns.clone() {
+    for (column_index, c) in s.columns.clone().into_iter().enumerate() {
         if x > w {
             break;
         }
@@ -759,34 +1020,33 @@ fn table(p: &mut Painter, s: &mut State) {
             continue;
         }
         let r = [x, top - hh, c.width, hh];
+        if metrics_view.is_some_and(|view| !c.numeric || !view(nsrect(r))) {
+            x += c.width;
+            continue;
+        }
         let a = Action::Sort(c.key.clone());
         if s.sort == c.key || s.hover == a {
-            p.fill(r, &gray(if dark { 0.24 } else { 0.92 }), 0.);
+            let shade = if dark {
+                0.22
+            } else if s.hover == a {
+                0.94
+            } else {
+                0.985
+            };
+            p.fill(r, &gray(shade), 0.);
         }
         if s.sort == c.key {
             let cx = x + c.width / 2.;
             let yy = top - hh + 5.;
             let pts = if s.ascending {
-                vec![(cx - 3., yy + 3.), (cx, yy), (cx + 3., yy + 3.)]
+                [(cx - 3., yy + 3.), (cx, yy), (cx + 3., yy + 3.)]
             } else {
-                vec![(cx - 3., yy), (cx, yy + 3.), (cx + 3., yy)]
+                [(cx - 3., yy), (cx, yy + 3.), (cx + 3., yy)]
             };
             p.line(&pts, &muted, 1.);
         }
         let summary = if [0, 4].contains(&s.page) {
-            match c.key.as_str() {
-                "cpu" => format!("{:0.0}%", s.system.cpu),
-                "memory" => format!("{:0.0}%", s.system.memory()),
-                "disk" => format!(
-                    "{}/s",
-                    bytes(s.system.read + s.system.write, s.prefs.binary)
-                ),
-                "network" => format!(
-                    "{}/s",
-                    bytes(s.system.sent + s.system.received, s.prefs.binary)
-                ),
-                _ => String::new(),
-            }
+            metric_heading(s, &c.key)
         } else {
             String::new()
         };
@@ -803,7 +1063,7 @@ fn table(p: &mut Painter, s: &mut State) {
         p.text(
             &c.title,
             [x + 8., top - 24., c.width - 16., 20.],
-            12.,
+            13.,
             false,
             &*if c.numeric { muted.clone() } else { fg.clone() },
             c.numeric,
@@ -813,14 +1073,16 @@ fn table(p: &mut Painter, s: &mut State) {
             &rule,
             0.6,
         );
-        hit(s, r, a, &format!("Sort by {}", c.title), true);
-        hit(
-            s,
-            [x + c.width - 3., top - hh, 6., hh],
-            Action::ResizeColumn(s.columns.iter().position(|q| q.key == c.key).unwrap()),
-            &format!("Resize {}", c.title),
-            true,
-        );
+        if metrics_view.is_none() {
+            hit(s, r, a, &format!("Sort by {}", c.title), true);
+            hit(
+                s,
+                [x + c.width - 3., top - hh, 6., hh],
+                Action::ResizeColumn(column_index),
+                &format!("Resize {}", c.title),
+                true,
+            );
+        }
         x += c.width;
     }
     p.line(&[(side, top - 0.5), (w, top - 0.5)], &rule, 1.);
@@ -829,24 +1091,17 @@ fn table(p: &mut Painter, s: &mut State) {
         NSGraphicsContext::saveGraphicsState_class();
         NSBezierPath::clipRect(rect(side, top, content_w, h - top - 15.));
     }
-    let visible_columns = s.columns.clone();
-    let start = (s.scroll / rh).floor() as usize;
-    let count = ((h - top) / rh).ceil() as usize + 2;
-    for (index, row) in s
-        .rows
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(count)
-        .map(|(i, r)| (i, r.clone()))
-        .collect::<Vec<_>>()
-    {
+    for index in s.visible_rows() {
+        let row = &s.rows[index];
         let y = top + index as f64 * rh - s.scroll;
+        if metrics_view.is_some_and(|view| !view(rect(side, y, content_w, rh))) {
+            continue;
+        }
         if row.section {
             p.text(
                 &row.name,
                 [side + 16., y + 5., content_w - 25., 23.],
-                14.,
+                15.,
                 false,
                 &fg,
                 false,
@@ -854,30 +1109,32 @@ fn table(p: &mut Painter, s: &mut State) {
             continue;
         }
         let selected = s.selected.as_ref() == Some(&row.id) || s.selections.contains(&row.id);
-        let hover = s.hover == Action::Select(row.id.clone());
+        let hover = matches!(&s.hover, Action::Select(id) if id == &row.id);
+        let hit_y = y.max(top);
+        let hit_h = ((y + rh).min(h - 15.) - hit_y).max(0.);
+        if metrics_view.is_none() {
+            s.hits.push(Hit {
+                rect: [side, hit_y, content_w, hit_h],
+                action: Action::Select(row.id.clone()),
+                label: row.name.clone(),
+                enabled: true,
+            });
+        }
         if selected || hover {
             p.fill(
                 [side, y, content_w, rh],
-                &gray(if dark {
-                    if selected {
-                        0.27
-                    } else {
-                        0.18
-                    }
-                } else if selected {
-                    0.90
-                } else {
-                    0.96
-                }),
+                &gray(row_background(dark, selected, hover)),
                 0.,
             );
         }
         let mut x = side - s.hscroll;
-        for c in &visible_columns {
+        for c in &s.columns {
             if x > w {
                 break;
             }
-            if x + c.width < side {
+            if x + c.width < side
+                || metrics_view.is_some_and(|v| !c.numeric || !v(rect(x, y, c.width, rh)))
+            {
                 x += c.width;
                 continue;
             }
@@ -890,30 +1147,36 @@ fn table(p: &mut Painter, s: &mut State) {
                         if expanded { "down" } else { "right" },
                         tx,
                         y + 7.,
-                        12.,
+                        13.,
                         &muted,
                     );
-                    hit(
-                        s,
-                        [tx - 4., y, 20., rh],
-                        Action::Expand(row.id.clone()),
-                        if expanded {
-                            "Collapse group"
-                        } else {
-                            "Expand group"
-                        },
-                        true,
-                    );
+                    if tx >= side && tx < side + content_w {
+                        s.hits.push(Hit {
+                            rect: [tx - 4., hit_y, 20., hit_h],
+                            action: Action::Expand(row.id.clone()),
+                            label: if expanded {
+                                "Collapse group"
+                            } else {
+                                "Expand group"
+                            }
+                            .into(),
+                            enabled: true,
+                        });
+                    }
+                }
+                if row.group || (s.page == 0 && s.prefs.grouped && !row.indent) {
                     tx += 21.;
                 }
                 if s.page == 6 {
                     p.icon("service.item", tx, y + 5., 17., &fg);
                 } else if s.page == 4 && !row.indent {
                     p.icon("4", tx, y + 5., 17., &muted);
-                } else if !row.icon.is_empty() {
+                } else if row.icon.ends_with(".app") {
                     p.image(&row.icon, [tx, y + 5., 17., 17.]);
                 } else {
-                    p.icon("app", tx, y + 5., 17., &muted);
+                    p.fill([tx + 1., y + 7., 15., 12.], &gray(0.97), 1.);
+                    p.outline([tx + 1., y + 7., 15., 12.], &gray(0.52), 0.7, 1.);
+                    p.fill([tx + 2., y + 8., 13., 2.5], &rgb(0.38, 0.64, 0.84), 0.);
                 }
                 tx += 25.;
                 let name = if row.group && row.members.len() > 1 {
@@ -924,52 +1187,23 @@ fn table(p: &mut Painter, s: &mut State) {
                 p.text(
                     &name,
                     [tx, y + 4., (x + c.width - tx - 8.).max(0.), 22.],
-                    12.,
+                    13.,
                     false,
                     &fg,
                     false,
                 );
             } else {
-                if [0, 4].contains(&s.page)
-                    && ["cpu", "memory", "disk", "network"].contains(&c.key.as_str())
-                    && row.numbers.contains_key(&c.key)
-                {
-                    let fraction = match c.key.as_str() {
-                        "cpu" => row.numbers[&c.key] / 100.,
-                        "memory" => row.numbers[&c.key] / s.system.raw.ram.max(1) as f64,
-                        "disk" => row.numbers[&c.key] / (s.system.read + s.system.write).max(1.),
-                        _ => 0.,
-                    };
-                    let alpha = (0.24 + fraction * 0.55).min(0.8);
-                    let heat = rgb(0.18, 0.66, 0.87).colorWithAlphaComponent(if dark {
-                        alpha * 0.45
-                    } else {
-                        alpha
-                    });
-                    p.fill([x + 0.5, y, c.width - 1., rh], &heat, 0.);
-                }
-                let value = s.row_value(&row, &c.key);
-                p.text(
-                    &value,
-                    [x + 8., y + 4., c.width - 16., 22.],
-                    12.,
-                    false,
-                    &fg,
-                    c.numeric,
-                );
+                paint_value(p, s, row, c, rect(x, y, c.width, rh), &fg);
             }
             x += c.width;
         }
-        // Row hit follows disclosure; search in reverse gives disclosure priority separately.
-        s.hits.insert(
-            0,
-            Hit {
-                rect: [side, y, content_w, rh],
-                action: Action::Select(row.id.clone()),
-                label: row.name.clone(),
-                enabled: true,
-            },
-        );
+    }
+    let mut edge = side - s.hscroll;
+    for c in &s.columns {
+        edge += c.width;
+        if edge > side && edge <= side + content_w {
+            p.line(&[(edge - 0.5, top), (edge - 0.5, h - 15.)], &rule, 0.65);
+        }
     }
     if s.rows.is_empty() {
         p.text(
@@ -988,6 +1222,9 @@ fn table(p: &mut Painter, s: &mut State) {
     unsafe {
         NSGraphicsContext::restoreGraphicsState_class();
     }
+    if metrics_view.is_some() {
+        return;
+    }
     scrollbars(p, s, top, s.max_scroll(), s.scroll, false);
     let total: f64 = s.columns.iter().map(|c| c.width).sum();
     if total > content_w {
@@ -998,7 +1235,7 @@ fn table(p: &mut Painter, s: &mut State) {
         );
         let thumb = (content_w / total * content_w).max(30.);
         let tx = side + s.hscroll / (total - content_w) * (content_w - thumb);
-        p.fill([tx + 1., h - 12., thumb - 2., 8.], &gray(0.54), 0.);
+        p.fill([tx + 1., h - 9., thumb - 2., 3.], &gray(0.53), 1.5);
         hit(
             s,
             [side, h - 15., content_w, 15.],
@@ -1009,19 +1246,17 @@ fn table(p: &mut Painter, s: &mut State) {
     }
 }
 fn scrollbars(p: &mut Painter, s: &mut State, top: f64, max: f64, offset: f64, settings: bool) {
-    if max <= 0. {
-        return;
-    }
     let viewport = s.height - top - 15.;
-    let total = viewport + max;
-    let thumb = (viewport / total * viewport).max(28.);
-    let yy = top + offset / max * (viewport - thumb);
+    let Some((thumb_top, thumb)) = vertical_scroll_thumb(viewport, max, offset) else {
+        return;
+    };
+    let yy = top + thumb_top;
     p.fill(
         [s.width - 15., top, 15., viewport],
         &gray(if s.prefs.dark { 0.14 } else { 0.965 }),
         0.,
     );
-    p.fill([s.width - 12., yy + 1., 8., thumb - 2.], &gray(0.54), 0.);
+    p.fill([s.width - 9., yy + 1., 3., thumb - 2.], &gray(0.53), 1.5);
     hit(
         s,
         [s.width - 15., top, 15., viewport],
@@ -1037,8 +1272,8 @@ fn scrollbars(p: &mut Painter, s: &mut State, top: f64, max: f64, offset: f64, s
 fn graph(
     p: &mut Painter,
     r: [f64; 4],
-    values: &[Option<f64>],
-    secondary: &[Option<f64>],
+    values: &[(f64, Option<f64>)],
+    secondary: &[(f64, Option<f64>)],
     max: f64,
     color: &NSColor,
     dark: bool,
@@ -1047,17 +1282,22 @@ fn graph(
     let [x, y, w, h] = r;
     p.fill(r, &gray(if dark { 0.1 } else { 1. }), 0.);
     if grid {
-        let c = gray(if dark { 0.2 } else { 0.9 });
+        let lines = NSBezierPath::bezierPath();
         let mut xx = x;
         while xx < x + w {
-            p.line(&[(xx, y), (xx, y + h)], &c, 0.5);
+            lines.moveToPoint(NSPoint::new(xx, y));
+            lines.lineToPoint(NSPoint::new(xx, y + h));
             xx += 20.;
         }
         let mut yy = y;
         while yy < y + h {
-            p.line(&[(x, yy), (x + w, yy)], &c, 0.5);
+            lines.moveToPoint(NSPoint::new(x, yy));
+            lines.lineToPoint(NSPoint::new(x + w, yy));
             yy += 20.;
         }
+        gray(if dark { 0.2 } else { 0.9 }).setStroke();
+        lines.setLineWidth(0.5);
+        lines.stroke();
     }
     p.outline(r, &color.colorWithAlphaComponent(0.6), 0.7, 0.);
     for (series, kernel) in [(values, false), (secondary, true)] {
@@ -1065,35 +1305,30 @@ fn graph(
             continue;
         }
         let path = NSBezierPath::bezierPath();
-        let mut active = false;
-        let mut start_x = x;
-        let mut last_x = x;
-        let mut area_points = vec![];
-        for (i, v) in series.iter().enumerate() {
-            let px = x + i as f64 / (series.len() - 1).max(1) as f64 * w;
-            if let Some(v) = v {
-                let py = y + h - (v / max.max(1.)).clamp(0., 1.) * h;
-                if !active {
-                    path.moveToPoint(NSPoint::new(px, py));
-                    start_x = px;
-                    active = true;
-                } else {
-                    path.lineToPoint(NSPoint::new(px, py));
-                }
-                area_points.push((px, py));
-                last_x = px;
-            } else {
-                active = false;
+        let fill = NSBezierPath::bezierPath();
+        for segment in series.split(|(_, v)| v.is_none()).filter(|v| !v.is_empty()) {
+            let mut points: Vec<_> = segment
+                .iter()
+                .map(|&(position, value)| {
+                    NSPoint::new(
+                        x + position * w,
+                        y + h - (value.unwrap() / max.max(1.)).clamp(0., 1.) * h,
+                    )
+                })
+                .collect();
+            let first = points[0];
+            let end = points[points.len() - 1];
+            let pointer = points.as_mut_ptr();
+            path.moveToPoint(first);
+            unsafe { path.appendBezierPathWithPoints_count(pointer, points.len() as isize) };
+            if !kernel {
+                fill.moveToPoint(NSPoint::new(first.x, y + h));
+                unsafe { fill.appendBezierPathWithPoints_count(pointer, points.len() as isize) };
+                fill.lineToPoint(NSPoint::new(end.x, y + h));
+                fill.closePath();
             }
         }
-        if !kernel && !area_points.is_empty() {
-            let fill = NSBezierPath::bezierPath();
-            fill.moveToPoint(NSPoint::new(start_x, y + h));
-            for (px, py) in &area_points {
-                fill.lineToPoint(NSPoint::new(*px, *py));
-            }
-            fill.lineToPoint(NSPoint::new(last_x, y + h));
-            fill.closePath();
+        if !kernel {
             color
                 .colorWithAlphaComponent(if dark { 0.17 } else { 0.075 })
                 .setFill();
@@ -1108,44 +1343,59 @@ fn graph(
         path.stroke();
     }
 }
-fn perf_values(s: &State, resource: usize, core: Option<usize>, kernel: bool) -> Vec<Option<f64>> {
-    let n = s.samples.len();
-    let take = (s.prefs.graph_seconds as f64 / s.prefs.speed.max(1) as f64).ceil() as usize + 1;
-    let mut v: Vec<_> = s
+fn perf_values(
+    s: &State,
+    resource: usize,
+    core: Option<usize>,
+    kernel: bool,
+) -> Vec<(f64, Option<f64>)> {
+    let Some(last) = s.samples.back() else {
+        return Vec::new();
+    };
+    let seconds = s.prefs.graph_seconds.clamp(30, 300) as f64;
+    let first = s
         .samples
-        .iter()
-        .skip(n.saturating_sub(take))
-        .map(|s| match resource {
-            0 => {
-                if let Some(i) = core {
-                    s.cores
+        .partition_point(|v| last.at.duration_since(v.at).as_secs_f64() > seconds);
+    let mut values = Vec::with_capacity(s.samples.len() - first);
+    for sample in s.samples.range(first..) {
+        let x = 1. - last.at.duration_since(sample.at).as_secs_f64() / seconds;
+        if !sample.continuous && !values.is_empty() {
+            values.push((x, None));
+        }
+        let value = match resource {
+            0 => match core {
+                Some(i) => {
+                    sample
+                        .cores
                         .get(i)
-                        .and_then(|v| v.map(|v| if kernel { v.1 } else { v.0 }))
-                } else {
-                    Some(if kernel {
-                        let count = s.cores.iter().flatten().count().max(1);
-                        s.cores.iter().flatten().map(|v| v.1).sum::<f64>() / count as f64
-                    } else {
-                        s.cpu
+                        .copied()
+                        .flatten()
+                        .map(|v| if kernel { v.1 } else { v.0 })
+                }
+                None if kernel => {
+                    let mut cores = sample.cores.iter().flatten();
+                    cores.next().map(|first| {
+                        let (sum, count) =
+                            cores.fold((first.1, 1), |(sum, n), c| (sum + c.1, n + 1));
+                        sum / f64::from(count)
                     })
                 }
-            }
-            1 => Some(s.memory()),
-            2 => {
-                if s.raw.disk_valid != 0 {
-                    Some(if kernel { s.write } else { s.read + s.write })
-                } else {
-                    None
-                }
-            }
-            3 => Some(if kernel { s.sent } else { s.received + s.sent }),
+                None => Some(sample.cpu),
+            },
+            1 => Some(sample.memory),
+            2 => sample
+                .disk
+                .map(|(read, write)| if kernel { write } else { read + write }),
+            3 => Some(if kernel {
+                sample.sent
+            } else {
+                sample.received + sample.sent
+            }),
             _ => None,
-        })
-        .collect();
-    while v.len() < take {
-        v.insert(0, None)
+        };
+        values.push((x, value));
     }
-    v
+    values
 }
 fn performance(p: &mut Painter, s: &mut State) {
     let side = s.sidebar();
@@ -1175,7 +1425,7 @@ fn performance(p: &mut Painter, s: &mut State) {
             }
             let values = perf_values(s, i, None, false);
             let max = if i == 2 || i == 3 {
-                values.iter().flatten().copied().fold(1., f64::max) * 1.1
+                values.iter().filter_map(|v| v.1).fold(1., f64::max) * 1.1
             } else {
                 100.
             };
@@ -1214,7 +1464,7 @@ fn performance(p: &mut Painter, s: &mut State) {
                     bytes(s.system.sent, false),
                     bytes(s.system.received, false)
                 ),
-                _ => "—".into(),
+                _ => "–".into(),
             };
             p.text(
                 &value,
@@ -1342,7 +1592,7 @@ fn performance(p: &mut Painter, s: &mut State) {
             vec![]
         };
         let max = if r == 2 || r == 3 {
-            v.iter().flatten().copied().fold(1., f64::max) * 1.1
+            v.iter().filter_map(|v| v.1).fold(1., f64::max) * 1.1
         } else {
             100.
         };
@@ -1405,17 +1655,20 @@ fn performance(p: &mut Painter, s: &mut State) {
         0 => {
             metrics = vec![
                 ("Utilization", format!("{:0.0}%", s.system.cpu)),
-                ("Speed", "—".into()),
+                ("Speed", "–".into()),
                 ("Processes", s.records.len().to_string()),
                 (
                     "Threads",
                     s.records
                         .iter()
-                        .map(|p| p.raw.threads.max(0) as u64)
-                        .sum::<u64>()
-                        .to_string(),
+                        .filter(|p| p.raw.valid != 0)
+                        .try_fold(0u64, |sum, p| {
+                            u64::try_from(p.raw.threads).ok().map(|n| sum + n)
+                        })
+                        .map(|sum| sum.to_string())
+                        .unwrap_or_else(|| "–".into()),
                 ),
-                ("Handles", "—".into()),
+                ("Handles", "–".into()),
                 (
                     "Up time",
                     format!(
@@ -1426,12 +1679,12 @@ fn performance(p: &mut Painter, s: &mut State) {
                 ),
             ];
             details = vec![
-                ("Base speed:", "—".into()),
+                ("Base speed:", "–".into()),
                 ("Sockets:", "1".into()),
                 ("Cores:", s.system.raw.physical.to_string()),
                 ("Logical processors:", s.system.raw.logical.to_string()),
                 ("Virtualization:", "Supported".into()),
-                ("L1/L2/L3 cache:", "—".into()),
+                ("L1/L2/L3 cache:", "–".into()),
             ];
         }
         1 => {
@@ -1475,9 +1728,9 @@ fn performance(p: &mut Painter, s: &mut State) {
                 ("Swap used", bytes(s.system.raw.swap_used as f64, true)),
             ];
             details = vec![
-                ("Speed:", "—".into()),
+                ("Speed:", "–".into()),
                 ("Form factor:", "Unified memory".into()),
-                ("Hardware reserved:", "—".into()),
+                ("Hardware reserved:", "–".into()),
             ];
         }
         2 => {
@@ -1490,8 +1743,8 @@ fn performance(p: &mut Painter, s: &mut State) {
                     "Write speed",
                     format!("{}/s", bytes(s.system.write, s.prefs.binary)),
                 ),
-                ("Active time", "—".into()),
-                ("Average response time", "—".into()),
+                ("Active time", "–".into()),
+                ("Average response time", "–".into()),
             ];
             details = vec![
                 (
@@ -1521,7 +1774,7 @@ fn performance(p: &mut Painter, s: &mut State) {
         }
         _ => {
             metrics = vec![
-                ("Utilization", "—".into()),
+                ("Utilization", "–".into()),
                 ("GPU memory", "Unified".into()),
             ];
             details = vec![
@@ -1728,7 +1981,11 @@ fn settings(p: &mut Painter, s: &mut State) {
         }
     }
     p.text(
-        "Task Manager 2.0 · Native Rust + AppKit",
+        concat!(
+            "Task Manager ",
+            env!("CARGO_PKG_VERSION"),
+            " · Native Rust + AppKit"
+        ),
         [left, y + 6., width, 24.],
         12.,
         false,
@@ -1945,4 +2202,32 @@ fn dialog(p: &mut Painter, s: &mut State) {
         Action::DialogCancel,
         true,
     );
+}
+
+#[cfg(test)]
+mod patch_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn cell_patch_uses_unclipped_coordinates_while_scrolled() {
+        let mut state = State::new();
+        state.page = 0;
+        state.columns = columns(0);
+        state.rows = vec![Row {
+            id: "visible".into(),
+            ..Row::default()
+        }];
+        state.hscroll = 470.;
+        state.scroll = 6.;
+        let side = state.sidebar();
+        let top = state.table_top();
+        let area = rect(side, top, 35., 22.);
+        let (row, column, frame) = metric_cell_at(&state, area).unwrap();
+        assert_eq!(row.id, "visible");
+        assert_eq!(column.key, "cpu");
+        assert_eq!(frame, rect(side - 50., top - 6., 85., 28.));
+        assert!(metric_cell_at(&state, rect(side, top, 36., 22.)).is_none());
+        state.rows[0].section = true;
+        assert!(metric_cell_at(&state, area).is_none());
+    }
 }

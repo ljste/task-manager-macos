@@ -687,18 +687,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     let name = (page == .details || indent > 0) ? p.name : (p.appName.isEmpty ? p.name : p.appName)
     var v: [String: String] = [
       "name": name, "pid": "\(p.pid)", "ppid": "\(p.ppid)", "status": p.status, "user": p.user,
-      "cpu": p.metricsValid ? String(format: "%.1f%%", p.cpu) : "—",
-      "memory": p.metricsValid ? bytes(Double(p.memory)) : "—",
+      "cpu": p.metricsValid ? String(format: "%.1f%%", p.cpu) : "–",
+      "memory": p.metricsValid ? bytes(Double(p.memory)) : "–",
       "mempercent": p.metricsValid
-        ? String(format: "%.1f%%", Metrics.memoryPercent(p.memory, total: system.raw.ram)) : "—",
-      "disk": p.ioValid ? bytes(p.diskRead + p.diskWrite) + "/s" : "—",
-      "time": p.metricsValid ? duration(Double(p.cpuNS) / 1e9) : "—",
-      "threads": p.metricsValid ? "\(p.threads)" : "—", "nice": "\(p.nice)", "arch": p.architecture,
+        ? String(format: "%.1f%%", Metrics.memoryPercent(p.memory, total: system.raw.ram)) : "–",
+      "disk": p.ioValid ? bytes(p.diskRead + p.diskWrite) + "/s" : "–",
+      "time": p.metricsValid ? duration(Double(p.cpuNS) / 1e9) : "–",
+      "threads": p.metricsValid ? "\(p.threads)" : "–", "nice": "\(p.nice)", "arch": p.architecture,
       "path": p.path.isEmpty ? "Unavailable" : p.path,
-      "bundle": p.bundleID.isEmpty ? "—" : p.bundleID,
+      "bundle": p.bundleID.isEmpty ? "–" : p.bundleID,
       "start": dateFormat.string(from: Date(timeIntervalSince1970: Double(p.start))),
     ]
-    for key in ["gpu", "engine", "network", "energy"] { v[key] = "—" }
+    for key in ["gpu", "engine", "network", "energy"] { v[key] = "–" }
     var n: [String: Double] = [:]
     for c in columns { n[c.key] = p.number(c.key, total: system.raw.ram) }
     return DisplayRow(
@@ -759,12 +759,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
         if restricted > 0 { row.values["status"] = "\(restricted) restricted" }
         if restricted == g.members.count {
           for key in ["cpu", "memory", "time", "threads", "mempercent"] {
-            row.values[key] = "—"
+            row.values[key] = "–"
             row.numbers[key] = nil
           }
         }
         if !g.members.contains(where: { $0.ioValid }) {
-          row.values["disk"] = "—"
+          row.values["disk"] = "–"
           row.numbers["disk"] = nil
         }
         groups.append(row)
@@ -824,7 +824,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
       next = sortedRows(next)
     case .startup, .services:
       for s in services
-      where (page == .services || s.path != "—")
+      where (page == .services || s.path != "–")
         && (q.isEmpty
           || [s.label, s.program, s.path, s.publisher, s.domain].contains {
             $0.localizedCaseInsensitiveContains(q)
@@ -835,11 +835,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             id: s.id,
             values: [
               "name": s.label, "status": s.status, "publisher": s.publisher,
-              "mechanism": s.mechanism, "domain": s.domain, "pid": s.pid.map { String($0) } ?? "—",
+              "mechanism": s.mechanism, "domain": s.domain, "pid": s.pid.map { String($0) } ?? "–",
               "enabled": s.disabled ? "No" : "Yes",
               "managed": s.mutable ? "Current user" : "System / vendor", "path": s.path,
               "program": s.program,
-              "modified": s.modified.map { dateFormat.string(from: $0) } ?? "—",
+              "modified": s.modified.map { dateFormat.string(from: $0) } ?? "–",
               "impact": "Not measured",
             ],
             numbers: [
@@ -864,8 +864,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
             values: [
               "name": user, "session": session, "count": "\(members.count)",
               "cpu": members.contains(where: { $0.metricsValid })
-                ? String(format: "%.1f%%", cpu) : "—",
-              "memory": members.contains(where: { $0.metricsValid }) ? bytes(Double(mem)) : "—",
+                ? String(format: "%.1f%%", cpu) : "–",
+              "memory": members.contains(where: { $0.metricsValid }) ? bytes(Double(mem)) : "–",
               "status": members.contains(where: { !$0.metricsValid }) ? "Partial data" : "",
             ], numbers: ["count": Double(members.count), "cpu": cpu, "memory": Double(mem)],
             members: members, group: true))
@@ -929,7 +929,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     }
     if page == .settings {
       footer.stringValue =
-        "No administrator privileges required · Unavailable metrics are displayed as —"
+        "No administrator privileges required · Unavailable metrics are displayed as –"
     }
     updateActions()
   }
@@ -973,7 +973,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
     }
     cell.title.textColor = .labelColor
     var icon: NSImage?
-    if key == "name" && !r.iconPath.isEmpty && r.iconPath != "—" {
+    if key == "name" && !r.iconPath.isEmpty && r.iconPath != "–" {
       if icons[r.iconPath] == nil {
         if icons.count > 1000 { icons.removeAll() }
         icons[r.iconPath] = NSWorkspace.shared.icon(forFile: r.iconPath)
@@ -1191,7 +1191,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
       add("Copy details", #selector(copyDetails))
     } else if let service = rowValue.service {
       add(service.disabled ? "Enable" : "Disable", #selector(toggleService), service.mutable)
-      add("Open file location", #selector(reveal), service.path != "—")
+      add("Open file location", #selector(reveal), service.path != "–")
       add("Search online", #selector(searchOnline))
       add("Copy details", #selector(copyDetails))
       add("Open Services", #selector(openLoginItems))
@@ -1376,7 +1376,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
   }
   @objc func copyDetails() {
     let text = selectedRows.map { r in
-      columns.map { "\($0.title): \(r.values[$0.key] ?? "—")" }.joined(separator: "\n")
+      columns.map { "\($0.title): \(r.values[$0.key] ?? "–")" }.joined(separator: "\n")
     }.joined(separator: "\n\n")
     copy(text)
   }
@@ -1388,7 +1388,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
   @objc func copyPath() { copy(selectedProcesses.map(\.path).joined(separator: "\n")) }
   @objc func reveal() {
     let paths = selectedRows.compactMap { $0.process?.path ?? $0.service?.path }.filter {
-      !$0.isEmpty && $0 != "—"
+      !$0.isEmpty && $0 != "–"
     }
     NSWorkspace.shared.activateFileViewerSelecting(paths.map { URL(fileURLWithPath: $0) })
   }
@@ -1426,7 +1426,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSTableViewDataSourc
   }
   @objc func about() {
     showError(
-      "Task Manager for macOS\nNative Swift + AppKit · Version 1.0\n\nCPU is normalized across all logical processors. Process memory is resident memory (RSS). — means unavailable, never zero. See README.md in the source project for API mappings and limitations."
+      "Task Manager for macOS\nNative Swift + AppKit · Version 1.0\n\nCPU is normalized across all logical processors. Process memory is resident memory (RSS). – means unavailable, never zero. See README.md in the source project for API mappings and limitations."
     )
   }
 }

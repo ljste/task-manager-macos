@@ -3,25 +3,43 @@ use crate::{
     model, power, services,
     state::*,
 };
+use dispatch2::{DispatchQueue, MainThreadBound};
 use objc2::AnyThread;
 use objc2::{
     define_class, msg_send,
-    rc::Retained,
+    rc::{Retained, Weak},
     runtime::{AnyObject, ProtocolObject},
     sel, DefinedClass, MainThreadOnly,
 };
 use objc2_app_kit::*;
 use objc2_foundation::*;
 use std::{
-    cell::{OnceCell, RefCell},
-    collections::VecDeque,
+    cell::{Cell, OnceCell, RefCell},
+    collections::{HashMap, VecDeque},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
+extern "C" {
+    fn tm_paint_view_bitmap(
+        view: &NSView,
+        area: NSRect,
+        paint: unsafe extern "C" fn(&NSView, NSRect),
+    ) -> bool;
+}
 struct Ivars {
     state: RefCell<State>,
     painter: RefCell<Painter>,
+    apps_changed: Cell<bool>,
+    regular_by_pid: RefCell<Option<HashMap<i32, String>>>,
+    aux_timer: RefCell<Option<Retained<NSTimer>>>,
     search: OnceCell<Retained<NSTextField>>,
     input: OnceCell<Retained<NSTextField>>,
+    live_table: RefCell<Option<Retained<LiveTable>>>,
+    table_bitmap: Cell<bool>,
+    bitmap_failed: Cell<bool>,
     restore: RefCell<Option<NSRect>>,
     timings: RefCell<VecDeque<(String, f64)>>,
     ax_nodes: RefCell<Vec<Retained<AnyObject>>>,
@@ -35,34 +53,85 @@ define_class!(
   fn accessibility_children(&self)->Retained<NSArray<AnyObject>>{self.ax_children()}
   #[unsafe(method_id(accessibilityChildrenInNavigationOrder))]
   fn navigation_children(&self)->Retained<NSArray<AnyObject>>{self.ax_children()}
+  #[unsafe(method(isOpaque))]fn opaque(&self)->bool{true}
   #[unsafe(method(isFlipped))]fn flipped(&self)->bool{true}
   #[unsafe(method(acceptsFirstResponder))]fn accepts(&self)->bool{true}
-  #[unsafe(method(drawRect:))]fn draw_rect(&self,_rect:NSRect){let start=Instant::now();{let mut s=self.ivars().state.borrow_mut();let bounds=self.bounds();s.width=bounds.size.width;s.height=bounds.size.height;draw::render(&mut self.ivars().painter.borrow_mut(),&mut s);if let Some(h)=s.hits.iter().find(|h|h.action==s.focus && s.focus!=Action::None){self.ivars().painter.borrow().outline(h.rect,&draw::rgb(0.,0.4,0.64),1.,2.);}model::push_history(&mut s.redraw_ms,start.elapsed().as_secs_f64()*1000.,1024);} }
-  #[unsafe(method(setFrameSize:))]fn frame_size(&self,size:NSSize){unsafe{let _:()=msg_send![super(self),setFrameSize:size];}self.layout_fields();}
+  #[unsafe(method(wantsUpdateLayer))]
+  fn uses_bitmap(&self) -> bool { self.ivars().table_bitmap.get() }
+
+  #[unsafe(method(updateLayer))]
+  fn update_layer(&self) {
+      if !unsafe { tm_paint_view_bitmap(self, self.bounds(), paint_canvas_bitmap) } {
+          self.request_native_redraw();
+      }
+  }
+
+  #[unsafe(method(redrawNativeCanvas:))]
+  fn redraw_native(&self, _sender: Option<&AnyObject>) { self.invalidate_canvas(); }
+
+  #[unsafe(method(drawRect:))]
+  fn draw_rect(&self, dirty: NSRect) { self.paint(dirty); }
+
+  #[unsafe(method(setFrameSize:))]
+  fn frame_size(&self, size: NSSize) {
+      unsafe { let _: () = msg_send![super(self), setFrameSize:size]; }
+      self.layout_fields();
+      self.invalidate_canvas();
+  }
+
+  #[unsafe(method(viewDidChangeBackingProperties))]
+  fn backing_changed(&self) {
+      unsafe { let _: () = msg_send![super(self), viewDidChangeBackingProperties]; }
+      self.invalidate_canvas();
+  }
   #[unsafe(method(mouseDown:))]fn mouse_down(&self,e:&NSEvent){let pt=self.convertPoint_fromView(e.locationInWindow(),None);let a=self.hit(pt.x,pt.y);if a==Action::None&&pt.y<48.{if e.clickCount()==2{self.dispatch(Action::Maximize)}else if let Some(w)=self.window(){w.performWindowDragWithEvent(e);}return}
    if [Action::ScrollV,Action::ScrollH].contains(&a)||matches!(a,Action::ResizeColumn(_)){let mut s=self.ivars().state.borrow_mut();let offset=match a{Action::ScrollH=>s.hscroll,Action::ResizeColumn(i)=>s.columns[i].width,_=>s.scroll};s.drag=Some((a.clone(),pt.x,pt.y,offset));drop(s);self.drag_scroll(&a,pt.x,pt.y,true);return}
    if let Action::Select(ref id)=a {
      let flags=e.modifierFlags();
      if flags.contains(NSEventModifierFlags::Command)||flags.contains(NSEventModifierFlags::Shift) {
        let mut s=self.ivars().state.borrow_mut();
+       let could_end=s.can_end();
        if flags.contains(NSEventModifierFlags::Shift){let from=s.selected.as_ref().and_then(|id|s.rows.iter().position(|r|&r.id==id));let to=s.rows.iter().position(|r|&r.id==id);if let(Some(a),Some(b))=(from,to){let ids=s.rows[a.min(b)..=a.max(b)].iter().filter(|r|!r.section).map(|r|r.id.clone()).collect::<Vec<_>>();s.selections.extend(ids);}}
        else {if let Some(old)=s.selected.clone(){s.selections.insert(old);}if !s.selections.remove(id){s.selections.insert(id.clone());}}
-       s.selected=if s.selections.contains(id){Some(id.clone())}else{s.selections.iter().next().cloned()};drop(s);self.redraw();return;
+       s.selected=if s.selections.contains(id){Some(id.clone())}else{s.selections.iter().next().cloned()};let same_toolbar=could_end==s.can_end();drop(s);self.redraw_interaction(same_toolbar);return;
      }
    }
    if let Action::Select(ref id)=a{if e.clickCount()==2{let group=self.ivars().state.borrow().rows.iter().any(|r|&r.id==id&&r.group);self.dispatch(if group{Action::Expand(id.clone())}else{Action::Properties});return}}
    if e.clickCount()==2 && matches!(a,Action::Menu(_)){self.dispatch(Action::GraphOnly);return}
-   if let Some(w)=self.window(){w.makeFirstResponder(Some(self));}self.ivars().state.borrow_mut().focus=Action::None;self.dispatch(a);
+   if let Some(w)=self.window(){w.makeFirstResponder(Some(self));}
+   let had_focus = std::mem::replace(&mut self.ivars().state.borrow_mut().focus, Action::None) != Action::None;
+   if had_focus { self.invalidate_canvas(); }
+   self.dispatch(a);
   }
-  #[unsafe(method(mouseUp:))]fn mouse_up(&self,_e:&NSEvent){self.ivars().state.borrow_mut().drag=None;}
+  #[unsafe(method(mouseUp:))]fn mouse_up(&self,_e:&NSEvent){if self.ivars().state.borrow_mut().drag.take().is_some(){self.poll();}}
   #[unsafe(method(mouseDragged:))]fn mouse_dragged(&self,e:&NSEvent){let pt=self.convertPoint_fromView(e.locationInWindow(),None);let a=self.ivars().state.borrow().drag.as_ref().map(|v|v.0.clone());if let Some(a)=a{self.drag_scroll(&a,pt.x,pt.y,false)}}
   #[unsafe(method(rightMouseDown:))]fn right_down(&self,e:&NSEvent){let pt=self.convertPoint_fromView(e.locationInWindow(),None);let a=self.hit(pt.x,pt.y);let mut s=self.ivars().state.borrow_mut();if let Action::Select(id)=a{if !s.selections.contains(&id){s.selections.clear();}s.selected=Some(id)}let items=if pt.y<48.{system_menu()}else if s.page==1{graph_menu(&s)}else{row_menu(&s)};open_menu(&mut s,items,pt.x,pt.y);drop(s);self.redraw();}
-  #[unsafe(method(mouseMoved:))]fn mouse_moved(&self,e:&NSEvent){let pt=self.convertPoint_fromView(e.locationInWindow(),None);let a=self.hit(pt.x,pt.y);let mut s=self.ivars().state.borrow_mut();if a==s.hover{return}s.hover=a.clone();let mut submenu=None;if let Action::Option(ref value)=a{if let Some((depth,index))=parse_menu(value){if let Some(menu)=s.menus.get_mut(depth){menu.selected=Some(index);if let Some(item)=menu.items.get(index){if !item.children.is_empty(){let yy=menu.y+4.+menu.items[..index].iter().map(|v|if v.title.is_empty(){9.}else{30.}).sum::<f64>();submenu=Some((depth,menu.x+252.,yy,item.children.clone()));}else{s.menus.truncate(depth+1);}}}}}if let Some((d,x,y,items))=submenu{s.menus.truncate(d+1);let x=if x+252.>s.width{(x-504.).max(0.)}else{x};let y=y.min((s.height-menu_height(&items)).max(0.));s.menus.push(Menu{x,y,items,selected:None});}drop(s);self.setNeedsDisplay(true);}
-  #[unsafe(method(mouseExited:))]fn mouse_exited(&self,_e:&NSEvent){self.ivars().state.borrow_mut().hover=Action::None;self.setNeedsDisplay(true);}
-  #[unsafe(method(scrollWheel:))]fn scroll_wheel(&self,e:&NSEvent){let mut s=self.ivars().state.borrow_mut();if let Some(d)=&s.dialog{if d.title.ends_with(" Properties"){s.dialog_scroll=(s.dialog_scroll-e.scrollingDeltaY()*8.).max(0.);drop(s);self.redraw();}return}if !s.menus.is_empty(){return}let factor=if e.hasPreciseScrollingDeltas(){1.}else{20.};if s.page==7{s.scroll=(s.scroll-e.scrollingDeltaY()*factor).clamp(0.,s.max_scroll());}else if ![1,7].contains(&s.page){s.scroll-=e.scrollingDeltaY()*factor;s.hscroll-=e.scrollingDeltaX()*factor;s.clamp_scroll();}drop(s);self.redraw();}
+  #[unsafe(method(mouseMoved:))]fn mouse_moved(&self,e:&NSEvent){let pt=self.convertPoint_fromView(e.locationInWindow(),None);let a=self.hit(pt.x,pt.y);let mut s=self.ivars().state.borrow_mut();if a==s.hover{return}let table_only=table_pointer_action(&s.hover)&&table_pointer_action(&a);s.hover=a.clone();let mut submenu=None;if let Action::Option(ref value)=a{if let Some((depth,index))=parse_menu(value){if let Some(menu)=s.menus.get_mut(depth){menu.selected=Some(index);if let Some(item)=menu.items.get(index){if !item.children.is_empty(){let yy=menu.y+4.+menu.items[..index].iter().map(|v|if v.title.is_empty(){9.}else{30.}).sum::<f64>();submenu=Some((depth,menu.x+252.,yy,item.children.clone()));}else{s.menus.truncate(depth+1);}}}}}if let Some((d,x,y,items))=submenu{s.menus.truncate(d+1);let x=if x+252.>s.width{(x-504.).max(0.)}else{x};let y=y.min((s.height-menu_height(&items)).max(0.));s.menus.push(Menu{x,y,items,selected:None});}drop(s);if table_only{self.redraw_interaction(true);}else{self.invalidate_canvas();}}
+  #[unsafe(method(mouseExited:))]
+  fn mouse_exited(&self, _e: &NSEvent) {
+      let before = std::mem::replace(&mut self.ivars().state.borrow_mut().hover, Action::None);
+      if before != Action::None {
+          if table_pointer_action(&before) { self.redraw_interaction(true); } else { self.invalidate_canvas(); }
+      }
+  }
+  #[unsafe(method(scrollWheel:))]fn scroll_wheel(&self,e:&NSEvent){let mut s=self.ivars().state.borrow_mut();if let Some(d)=&s.dialog{if d.title.ends_with(" Properties"){s.dialog_scroll=(s.dialog_scroll-e.scrollingDeltaY()*8.).max(0.);drop(s);self.redraw();}return}if !s.menus.is_empty(){return}let factor=if e.hasPreciseScrollingDeltas(){1.}else{20.};if s.page==7{s.scroll=(s.scroll-e.scrollingDeltaY()*factor).clamp(0.,s.max_scroll());}else if ![1,7].contains(&s.page){s.scroll-=e.scrollingDeltaY()*factor;s.hscroll-=e.scrollingDeltaX()*factor;s.clamp_scroll();}drop(s);self.redraw_interaction(true);}
   #[unsafe(method(keyDown:))]fn key_down(&self,e:&NSEvent){if !self.key(e){unsafe{let _:()=msg_send![super(self),keyDown:e];}}}
   #[unsafe(method(performKeyEquivalent:))]fn equivalent(&self,e:&NSEvent)->bool{self.key(e)}
-  #[unsafe(method(tick:))]fn tick(&self,_timer:&NSTimer){self.poll();self.record_frame();}
+  #[unsafe(method(workspaceAppsChanged:))]
+  fn workspace_apps_changed(&self, notification: &NSNotification) {
+      self.update_app(notification);
+  }
+  #[unsafe(method(tick:))]fn tick(&self,_timer:&NSTimer){self.poll();}
+  #[unsafe(method(auxiliaryTick:))]fn auxiliary_tick(&self, timer:&NSTimer){
+      if self.ivars().painter.borrow_mut().warm_images() {
+          self.invalidate_canvas();
+      }
+      self.record_frame();
+      if self.ivars().painter.borrow().pending_images.is_empty() && self.ivars().recording.borrow().is_none(){
+          timer.invalidate();
+          self.ivars().aux_timer.borrow_mut().take();
+      }
+  }
   #[unsafe(method(menuAction:))]fn menu_action(&self,item:&NSMenuItem){let n=item.tag();self.dispatch(match n{0..=7=>Action::Page(n as usize),10=>Action::Run,11=>Action::Refresh,12=>Action::Setting("speed".into()),13=>Action::About,14=>Action::Quit,15=>{self.focus_search();return},_=>Action::None});}
  }
  unsafe impl NSTextFieldDelegate for Canvas{}
@@ -70,16 +139,389 @@ define_class!(
   #[unsafe(method(controlTextDidChange:))]fn text_changed(&self,_notification:&NSNotification){if let Some(field)=self.ivars().search.get(){let mut s=self.ivars().state.borrow_mut();s.query=field.stringValue().to_string();s.scroll=0.;s.rebuild();drop(s);self.redraw();}}
  }
 );
+unsafe extern "C" fn paint_canvas_bitmap(view: &NSView, area: NSRect) {
+    if let Some(canvas) = view.downcast_ref::<Canvas>() {
+        canvas.paint(area);
+    }
+}
+
+#[derive(Default)]
+struct TableDamage {
+    pending: RefCell<Vec<NSRect>>,
+}
+
+unsafe extern "C" fn paint_table_surface(view: &NSView, area: NSRect) {
+    let Some(parent) = (unsafe { view.superview() }) else {
+        return;
+    };
+    let Some(canvas) = parent.downcast_ref::<Canvas>() else {
+        return;
+    };
+    let mut state = canvas.ivars().state.borrow_mut();
+    let mut painter = canvas.ivars().painter.borrow_mut();
+    if area == view.bounds() {
+        draw::redraw_table(&mut painter, &mut state, view, area);
+    } else {
+        let touches = |rect| NSIntersectsRect(area, rect);
+        draw::paint_table_region(&mut painter, &mut state, Some(&touches), area);
+    }
+    if !painter.pending_images.is_empty() {
+        canvas.start_aux_timer();
+    }
+}
+
+define_class!(
+    #[unsafe(super=NSView)]
+    #[thread_kind=MainThreadOnly]
+    #[ivars=TableDamage]
+    struct LiveTable;
+
+    unsafe impl NSObjectProtocol for LiveTable {}
+    impl LiveTable {
+        #[unsafe(method(isFlipped))]
+        fn flipped(&self) -> bool { true }
+        #[unsafe(method(isOpaque))]
+        fn opaque(&self) -> bool { false }
+        #[unsafe(method_id(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> Option<Retained<NSView>> { None }
+        #[unsafe(method(wantsUpdateLayer))]
+        fn updates_layer(&self) -> bool { true }
+        #[unsafe(method(updateLayer))]
+        fn update_layer(&self) {
+            let mut pending = self.ivars().pending.borrow_mut();
+            if pending.is_empty() { return; }
+            let Some(parent) = (unsafe { self.superview() }) else { return };
+            let Some(canvas) = parent.downcast_ref::<Canvas>() else { return };
+            let start = Instant::now();
+            for area in pending.drain(..) {
+                if !unsafe { tm_paint_view_bitmap(self, area, paint_table_surface) } {
+                    canvas.request_native_redraw();
+                    return;
+                }
+            }
+            model::push_history(&mut canvas.ivars().state.borrow_mut().redraw_ms,
+                start.elapsed().as_secs_f64() * 1000., 1024);
+        }
+        #[unsafe(method(drawRect:))]
+        fn draw_table(&self, dirty: NSRect) {
+            let Some(parent) = (unsafe { self.superview() }) else { return };
+            let Some(canvas) = parent.downcast_ref::<Canvas>() else { return };
+            let start = Instant::now();
+            let mut state = canvas.ivars().state.borrow_mut();
+            let mut painter = canvas.ivars().painter.borrow_mut();
+            draw::redraw_table(&mut painter, &mut state, self, dirty);
+            if !painter.pending_images.is_empty() {
+                canvas.start_aux_timer();
+            }
+            model::push_history(&mut state.redraw_ms, start.elapsed().as_secs_f64() * 1000., 1024);
+        }
+    }
+);
+
+fn table_pointer_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::None
+            | Action::Sort(_)
+            | Action::Select(_)
+            | Action::Expand(_)
+            | Action::ScrollH
+            | Action::ScrollV
+            | Action::ResizeColumn(_)
+    )
+}
+
+fn table_frame(state: &State) -> NSRect {
+    rect(
+        state.sidebar(),
+        96.,
+        state.width - state.sidebar(),
+        state.height - 96.,
+    )
+}
+
+impl LiveTable {
+    fn attach(canvas: &Canvas, frame: NSRect) -> Retained<Self> {
+        let table = Self::alloc(canvas.mtm()).set_ivars(TableDamage::default());
+        let table: Retained<Self> = unsafe { msg_send![super(table), initWithFrame:frame] };
+        table.setClipsToBounds(true);
+        table.setWantsLayer(true);
+        // Use canvas coordinates so painting, damage and hit testing share geometry.
+        table.setBoundsOrigin(frame.origin);
+        unsafe {
+            let _: () = msg_send![&*table, setAccessibilityElement:false];
+            let _: () = msg_send![&*table, setAccessibilityHidden:true];
+            canvas.addSubview(&table);
+        }
+        table.setNeedsDisplay(true);
+        table
+    }
+}
+
+struct TableRowLabel {
+    id: String,
+    name: String,
+    icon: String,
+    status: String,
+    members: usize,
+    group: bool,
+    section: bool,
+    indent: bool,
+}
+
+impl TableRowLabel {
+    fn capture(s: &State, row: &Row) -> Self {
+        Self {
+            id: row.id.clone(),
+            name: row.name.clone(),
+            icon: row.icon.clone(),
+            status: s.row_value(row, "status").into_owned(),
+            members: row.members.len(),
+            group: row.group,
+            section: row.section,
+            indent: row.indent,
+        }
+    }
+
+    fn matches(&self, s: &State, row: &Row) -> bool {
+        self.id == row.id
+            && self.name == row.name
+            && self.icon == row.icon
+            && self.status == s.row_value(row, "status")
+            && self.members == row.members.len()
+            && self.group == row.group
+            && self.section == row.section
+            && self.indent == row.indent
+    }
+}
+
+struct TableMetricColumn {
+    index: usize,
+    left: f64,
+    width: f64,
+    heading: String,
+    cells: Vec<draw::MetricCell>,
+}
+
+struct TableSnapshot {
+    scroll: f64,
+    hscroll: f64,
+    scroll_thumb: Option<(f64, f64)>,
+    has_selection: bool,
+    selection_count: usize,
+    can_end: bool,
+    labels: Vec<TableRowLabel>,
+    columns: Vec<TableMetricColumn>,
+}
+
+impl TableSnapshot {
+    fn scroll_thumb(s: &State) -> Option<(f64, f64)> {
+        vertical_scroll_thumb(s.height - s.table_top() - 15., s.max_scroll(), s.scroll)
+    }
+
+    fn capture(s: &State) -> Self {
+        let visible = &s.rows[s.visible_rows()];
+        let sidebar = s.sidebar();
+        let mut x = sidebar - s.hscroll;
+        let mut columns = Vec::new();
+        for (index, column) in s.columns.iter().enumerate() {
+            let left = x.max(sidebar);
+            x += column.width;
+            let right = x.min(s.width - 15.);
+            if column.numeric && left < right {
+                columns.push(TableMetricColumn {
+                    index,
+                    left,
+                    width: right - left,
+                    heading: draw::metric_heading(s, &column.key),
+                    cells: visible
+                        .iter()
+                        .filter(|r| !r.section)
+                        .map(|r| draw::MetricCell::new(s, r, &column.key))
+                        .collect(),
+                });
+            }
+        }
+        Self {
+            scroll: s.scroll,
+            hscroll: s.hscroll,
+            scroll_thumb: Self::scroll_thumb(s),
+            has_selection: s.selected.is_some(),
+            selection_count: s.selections.len(),
+            can_end: s.can_end(),
+            labels: visible
+                .iter()
+                .map(|row| TableRowLabel::capture(s, row))
+                .collect(),
+            columns,
+        }
+    }
+
+    fn selection_changed(&self, s: &State) -> bool {
+        self.has_selection != s.selected.is_some()
+            || self.selection_count != s.selections.len()
+            || self.can_end != s.can_end()
+    }
+
+    fn invalidate_changes(&self, s: &State, mut invalidate: impl FnMut(NSRect)) -> bool {
+        let visible = s.visible_rows();
+        if self.scroll != s.scroll
+            || self.hscroll != s.hscroll
+            || self.scroll_thumb != Self::scroll_thumb(s)
+            || self.labels.len() != visible.len()
+            || !self
+                .labels
+                .iter()
+                .zip(&s.rows[visible.clone()])
+                .all(|(a, b)| (a.section && b.section) || a.matches(s, b))
+        {
+            return false;
+        }
+
+        let top = s.table_top();
+        let height = s.row_height();
+        for (i, old) in visible.clone().zip(&self.labels) {
+            let row = &s.rows[i];
+            if row.section && old.name != row.name {
+                let y = top + i as f64 * height - s.scroll;
+                let start = y.max(top);
+                let end = (y + height).min(s.height - 15.);
+                if end > start {
+                    invalidate(rect(
+                        s.sidebar(),
+                        start,
+                        s.width - s.sidebar() - 15.,
+                        end - start,
+                    ));
+                }
+            }
+        }
+        for column in &self.columns {
+            let key = &s.columns[column.index].key;
+            if column.heading != draw::metric_heading(s, key) {
+                invalidate(rect(
+                    column.left,
+                    top - s.header_height(),
+                    column.width,
+                    s.header_height(),
+                ));
+            }
+            for (index, before) in visible
+                .clone()
+                .filter(|&i| !s.rows[i].section)
+                .zip(&column.cells)
+            {
+                let y = top + index as f64 * height - s.scroll;
+                let start = y.max(top);
+                let end = (y + height).min(s.height - 15.);
+                if start < end && *before != draw::MetricCell::new(s, &s.rows[index], key) {
+                    invalidate(rect(column.left, start, column.width, end - start));
+                }
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod live_table_tests {
+    use super::*;
+
+    fn table() -> State {
+        let mut s = State::new();
+        s.page = 0;
+        s.columns = columns(0);
+        s.prefs.dark = false;
+        s.rows = vec![Row {
+            id: "editor".into(),
+            metrics: RowMetrics {
+                cpu: Some(0.),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        s
+    }
+
+    #[test]
+    fn damage_tracks_displayed_text_and_heat() {
+        let mut s = table();
+        let before = TableSnapshot::capture(&s);
+        s.system.cpu = 0.01;
+        s.rows[0].metrics.cpu = Some(0.000001);
+        assert!(before.invalidate_changes(&s, |_| panic!("unchanged appearance")));
+
+        s.rows[0].metrics.cpu = Some(0.04);
+        let mut damage = Vec::new();
+        assert!(before.invalidate_changes(&s, |area| damage.push(area)));
+        assert_eq!(
+            damage,
+            vec![rect(s.metrics_left(), s.table_top(), 85., s.row_height())]
+        );
+    }
+
+    #[test]
+    fn section_count_changes_paint_only_the_heading_row() {
+        let mut s = table();
+        s.rows.insert(
+            0,
+            Row {
+                id: "section:Apps (1)".into(),
+                name: "Apps (1)".into(),
+                section: true,
+                ..Default::default()
+            },
+        );
+        let before = TableSnapshot::capture(&s);
+        s.rows[0].id = "section:Apps (2)".into();
+        s.rows[0].name = "Apps (2)".into();
+        let mut damage = Vec::new();
+        assert!(before.invalidate_changes(&s, |r| damage.push(r)));
+        assert_eq!(
+            damage,
+            vec![rect(
+                s.sidebar(),
+                s.table_top(),
+                s.width - s.sidebar() - 15.,
+                s.row_height()
+            )]
+        );
+    }
+
+    #[test]
+    fn partial_damage_requires_matching_visible_identities_and_scrollbar() {
+        let mut s = table();
+        s.rows.resize(1000, Row::default());
+        let before = TableSnapshot::capture(&s);
+        s.rows.pop();
+        assert!(before.invalidate_changes(&s, |_| panic!("offscreen row")));
+        s.rows[0].id = "another process".into();
+        assert!(!before.invalidate_changes(&s, |_| panic!("table rebuild required")));
+
+        s.rows.truncate(25);
+        let before = TableSnapshot::capture(&s);
+        s.rows.pop();
+        assert!(!before.invalidate_changes(&s, |_| panic!("scrollbar changed")));
+    }
+}
+
 impl Canvas {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let mut s = State::new();
         s.login_enabled = login_enabled();
-        workers(s.shared.clone());
+        let shared = s.shared.clone();
+        let table_bitmap = matches!(s.page, 0 | 4) && !s.graph_only;
         let this = Self::alloc(mtm).set_ivars(Ivars {
             state: RefCell::new(s),
             painter: RefCell::new(Painter::new(mtm)),
+            apps_changed: Cell::new(true),
+            regular_by_pid: RefCell::new(None),
+            aux_timer: RefCell::new(None),
             search: OnceCell::new(),
             input: OnceCell::new(),
+            live_table: RefCell::new(None),
+            table_bitmap: Cell::new(table_bitmap),
+            bitmap_failed: Cell::new(false),
             restore: RefCell::new(None),
             timings: RefCell::new(VecDeque::new()),
             ax_nodes: RefCell::new(Vec::new()),
@@ -87,6 +529,7 @@ impl Canvas {
         });
         let this: Retained<Self> =
             unsafe { msg_send![super(this),initWithFrame:rect(0.,0.,1120.,720.)] };
+        this.setWantsLayer(true);
         let field = unsafe {
             NSTextField::initWithFrame(NSTextField::alloc(mtm), rect(350., 12., 420., 28.))
         };
@@ -124,8 +567,21 @@ impl Canvas {
         };
         this.addTrackingArea(&tracking);
         unsafe {
+            let workspace = NSWorkspace::sharedWorkspace().notificationCenter();
+            for name in [
+                NSWorkspaceDidLaunchApplicationNotification,
+                NSWorkspaceDidTerminateApplicationNotification,
+                NSWorkspaceDidActivateApplicationNotification,
+            ] {
+                workspace.addObserver_selector_name_object(
+                    &this,
+                    sel!(workspaceAppsChanged:),
+                    Some(name),
+                    None,
+                );
+            }
             let timer = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                0.05,
+                30.,
                 &this,
                 sel!(tick:),
                 None,
@@ -139,8 +595,100 @@ impl Canvas {
         }
         this.ivars().painter.borrow_mut().load_image("appicon");
         this.layout_fields();
+        let target = Arc::new(MainThreadBound::new(Weak::from(&this), mtm));
+        let queued = Arc::new(AtomicBool::new(false));
+        let _ = shared.on_delivery.set(Box::new(move || {
+            if queued.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let target = target.clone();
+            let queued = queued.clone();
+            DispatchQueue::main().exec_async(move || {
+                queued.store(false, Ordering::Release);
+                let mtm = MainThreadMarker::new().expect("main dispatch queue");
+                if let Some(canvas) = target.get(mtm).load() {
+                    canvas.poll();
+                }
+            });
+        }));
+        workers(shared);
         this
     }
+    fn start_aux_timer(&self) {
+        let mut slot = self.ivars().aux_timer.borrow_mut();
+        if slot.is_none() {
+            let timer = unsafe {
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.05,
+                    self,
+                    sel!(auxiliaryTick:),
+                    None,
+                    true,
+                )
+            };
+            unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+            *slot = Some(timer);
+        }
+    }
+
+    fn regular_path(app: &NSRunningApplication) -> Option<String> {
+        if app.activationPolicy() == NSApplicationActivationPolicy::Regular {
+            app.bundleURL()?.path().map(|path| path.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn update_app(&self, notification: &NSNotification) {
+        let app = notification.userInfo().and_then(|info| {
+            info.objectForKey(unsafe { NSWorkspaceApplicationKey })
+                .and_then(|value| value.downcast::<NSRunningApplication>().ok())
+        });
+        let Some(app) = app else {
+            self.ivars().regular_by_pid.replace(None);
+            self.ivars().apps_changed.set(true);
+            return;
+        };
+        let pid = app.processIdentifier();
+        let path =
+            if *notification.name() == *unsafe { NSWorkspaceDidTerminateApplicationNotification } {
+                None
+            } else {
+                Self::regular_path(&app)
+            };
+        if let Some(by_pid) = self.ivars().regular_by_pid.borrow_mut().as_mut() {
+            if by_pid.get(&pid) != path.as_ref() {
+                if let Some(path) = path {
+                    by_pid.insert(pid, path);
+                } else {
+                    by_pid.remove(&pid);
+                }
+                self.ivars().apps_changed.set(true);
+            }
+        }
+    }
+
+    fn update_regular_apps(&self, s: &mut State) -> bool {
+        if s.page != 0 || !s.prefs.grouped || !self.ivars().apps_changed.replace(false) {
+            return false;
+        }
+        if self.ivars().regular_by_pid.borrow().is_none() {
+            let apps = NSWorkspace::sharedWorkspace()
+                .runningApplications()
+                .iter()
+                .filter_map(|app| Some((app.processIdentifier(), Self::regular_path(&app)?)))
+                .collect();
+            self.ivars().regular_by_pid.replace(Some(apps));
+        }
+        let cache = self.ivars().regular_by_pid.borrow();
+        let paths = cache.as_ref().unwrap().values().cloned().collect();
+        if s.regular_apps == paths {
+            return false;
+        }
+        s.regular_apps = paths;
+        true
+    }
+
     fn hit(&self, x: f64, y: f64) -> Action {
         let s = self.ivars().state.borrow();
         if let Some(h) = s.hits.iter().rev().find(|h| h.contains(x, y)) {
@@ -161,13 +709,104 @@ impl Canvas {
         }
         Action::None
     }
+    fn paint(&self, dirty: NSRect) {
+        let start = Instant::now();
+        let mut s = self.ivars().state.borrow_mut();
+        let bounds = self.bounds();
+        s.width = bounds.size.width;
+        s.height = bounds.size.height;
+        let mut painter = self.ivars().painter.borrow_mut();
+        if dirty.origin.x >= s.sidebar()
+            && dirty.origin.y >= 96.
+            && matches!(s.page, 0 | 2 | 3 | 4 | 5 | 6)
+            && s.dialog.is_none()
+            && s.menus.is_empty()
+        {
+            draw::redraw_table(&mut painter, &mut s, self, dirty);
+        } else {
+            draw::render(&mut painter, &mut s);
+        }
+        if let Some(h) = s
+            .hits
+            .iter()
+            .find(|h| h.action == s.focus && s.focus != Action::None)
+        {
+            painter.outline(h.rect, &draw::rgb(0., 0.4, 0.64), 1., 2.);
+        }
+        model::push_history(
+            &mut s.redraw_ms,
+            start.elapsed().as_secs_f64() * 1000.,
+            1024,
+        );
+        if !painter.pending_images.is_empty() {
+            self.start_aux_timer();
+        }
+    }
+
+    fn request_native_redraw(&self) {
+        self.ivars().bitmap_failed.set(true);
+        self.ivars().table_bitmap.set(false);
+        unsafe {
+            let _: () = msg_send![self, performSelector:sel!(redrawNativeCanvas:),
+                withObject:std::ptr::null::<AnyObject>(), afterDelay:0.0f64];
+        }
+    }
+
+    fn discard_table(&self) {
+        let table = self.ivars().live_table.borrow_mut().take();
+        if let Some(table) = table {
+            table.removeFromSuperview();
+        }
+    }
+
+    fn invalidate_canvas(&self) {
+        self.discard_table();
+        self.setNeedsDisplay(true);
+    }
+
+    fn invalidate_table(&self, frame: NSRect, dirty: NSRect) {
+        if !self.ivars().table_bitmap.get() {
+            self.setNeedsDisplayInRect(dirty);
+            return;
+        }
+        let mut active = self.ivars().live_table.borrow_mut();
+        let table = active.get_or_insert_with(|| LiveTable::attach(self, frame));
+        let mut pending = table.ivars().pending.borrow_mut();
+        if dirty == frame {
+            pending.clear();
+        }
+        if !pending.contains(&frame) && !pending.contains(&dirty) {
+            pending.push(dirty);
+            table.setNeedsDisplay(true);
+        }
+    }
+
+    fn redraw_interaction(&self, table_only: bool) {
+        if table_only && self.ivars().table_bitmap.get() {
+            let s = self.ivars().state.borrow();
+            if s.focus == Action::None
+                && s.menus.is_empty()
+                && s.dialog.is_none()
+                && !s.hits.is_empty()
+            {
+                let frame = table_frame(&s);
+                self.invalidate_table(frame, frame);
+                return;
+            }
+        }
+        self.redraw();
+    }
+
     fn redraw(&self) {
         self.layout_fields();
-        self.setNeedsDisplay(true);
+        self.invalidate_canvas();
     }
     fn layout_fields(&self) {
         let b = self.bounds();
         if let Ok(mut s) = self.ivars().state.try_borrow_mut() {
+            self.ivars()
+                .table_bitmap
+                .set(!self.ivars().bitmap_failed.get() && matches!(s.page, 0 | 4) && !s.graph_only);
             s.width = b.size.width;
             s.height = b.size.height;
             let hidden = s.graph_only || ![0, 3, 4, 5, 6].contains(&s.page) || s.dialog.is_some();
@@ -210,7 +849,7 @@ impl Canvas {
         };
         let shared = self.ivars().state.borrow().shared.clone();
         let (sample, services, results) = {
-            let mut q = shared.lock().unwrap();
+            let mut q = shared.data.lock().unwrap();
             (
                 if frozen { None } else { q.latest.take() },
                 if frozen { None } else { q.services.take() },
@@ -219,31 +858,35 @@ impl Canvas {
         };
         let icons_changed = self.ivars().painter.borrow_mut().warm_images();
         let mut changed = false;
+        let mut rows_changed = false;
+        let mut commands_changed = false;
+        let mut previous_table = None;
+        let mut rows_ready = false;
+        let has_results = !results.is_empty();
         {
             let mut s = self.ivars().state.borrow_mut();
             if let Some(sample) = sample {
                 if s.prefs.speed != 0 {
                     s.history.ingest(&sample.processes, sample.system.elapsed);
                 }
-                s.regular_apps = NSWorkspace::sharedWorkspace()
-                    .runningApplications()
-                    .iter()
-                    .filter(|app| app.activationPolicy() == NSApplicationActivationPolicy::Regular)
-                    .filter_map(|app| {
-                        app.bundleURL()
-                            .and_then(|url| url.path())
-                            .map(|p| p.to_string())
-                    })
-                    .collect();
-                s.records = sample.processes;
+                if matches!(s.page, 0 | 4)
+                    && !icons_changed
+                    && !has_results
+                    && s.focus == Action::None
+                {
+                    previous_table = Some(TableSnapshot::capture(&s));
+                }
+                let apps_changed = self.update_regular_apps(&mut s);
+                rows_ready = s.replace_processes(sample.processes, apps_changed);
+                model::record_graph(&mut s.samples, sample.at, &sample.system);
                 s.system = sample.system;
-                let system = s.system.clone();
-                model::push_history(&mut s.samples, system, 301);
-                changed = true;
+                rows_changed = matches!(s.page, 0 | 2 | 4 | 5);
+                changed = rows_changed || s.page == 1;
             }
             if let Some(services) = services {
                 s.services = services;
-                changed = true;
+                rows_changed |= matches!(s.page, 3 | 6);
+                changed |= rows_changed;
             }
             for r in results {
                 s.busy = false;
@@ -292,14 +935,15 @@ impl Canvas {
                 }
                 changed = true;
             }
-            let info = NSProcessInfo::processInfo();
-            let low = info.isLowPowerModeEnabled();
-            if low != s.power_on {
-                s.power_on = low;
-                changed = true;
-            }
-            if changed && s.menus.is_empty() && s.dialog.is_none() && s.drag.is_none() {
-                s.rebuild();
+            if rows_changed {
+                let had_selection = s.selected.is_some() || !s.selections.is_empty();
+                if !rows_ready {
+                    s.rebuild();
+                }
+                commands_changed |= had_selection
+                    && previous_table
+                        .as_ref()
+                        .is_none_or(|table| !rows_ready && table.selection_changed(&s));
             }
             if s.last_save.elapsed() > Duration::from_secs(30) {
                 let prefs = s.prefs.clone();
@@ -320,8 +964,30 @@ impl Canvas {
                 s.last_save = Instant::now();
             }
         }
+        if has_results {
+            self.layout_fields();
+        }
         if changed || icons_changed {
-            self.redraw();
+            let s = self.ivars().state.borrow();
+            if !commands_changed
+                && !has_results
+                && matches!(s.page, 0 | 2 | 3 | 4 | 5 | 6)
+                && s.dialog.is_none()
+                && s.menus.is_empty()
+                && s.focus == Action::None
+                && (previous_table.is_some() || (s.selected.is_none() && s.selections.is_empty()))
+                && !s.graph_only
+            {
+                let frame = table_frame(&s);
+                if previous_table.is_some_and(|table| {
+                    table.invalidate_changes(&s, |area| self.invalidate_table(frame, area))
+                }) {
+                    return;
+                }
+                self.invalidate_table(frame, frame);
+            } else {
+                self.invalidate_canvas();
+            }
         }
     }
     fn drag_scroll(&self, a: &Action, x: f64, y: f64, first: bool) {
@@ -379,7 +1045,7 @@ impl Canvas {
             _ => {}
         }
         drop(s);
-        self.redraw();
+        self.redraw_interaction(true);
     }
     fn key(&self, e: &NSEvent) -> bool {
         let key = e.keyCode();
@@ -501,7 +1167,11 @@ impl Canvas {
                 }
                 _ => {}
             }
+            let closed = s.menus.is_empty();
             drop(s);
+            if closed {
+                self.poll();
+            }
             self.redraw();
             return true;
         }
@@ -548,6 +1218,8 @@ impl Canvas {
             self.dispatch(a);
             return true;
         }
+        let table_key = matches!(key, 115 | 116 | 119 | 121 | 123..=126);
+        let previous_end = (table_key && self.ivars().table_bitmap.get()).then(|| s.can_end());
         match key {
             53 => {
                 if s.graph_only {
@@ -612,29 +1284,51 @@ impl Canvas {
             119 => s.scroll = s.max_scroll(),
             _ => return false,
         }
+        let table_only = previous_end.is_some_and(|end| end == s.can_end());
         drop(s);
-        self.redraw();
+        self.redraw_interaction(table_only);
         true
     }
     pub fn dispatch(&self, action: Action) {
         let start = Instant::now();
+        let (frozen, previous_end) = {
+            let s = self.ivars().state.borrow();
+            let frozen = s.dialog.is_some() || !s.menus.is_empty();
+            let table_action = matches!(
+                action,
+                Action::Sort(_) | Action::Select(_) | Action::Expand(_)
+            );
+            let previous_end =
+                (table_action && !frozen && self.ivars().table_bitmap.get()).then(|| s.can_end());
+            (frozen, previous_end)
+        };
         self.act(action.clone());
-        self.ivars()
-            .timings
-            .borrow_mut()
-            .push_back((format!("{action:?}"), start.elapsed().as_secs_f64() * 1000.));
-        if self.ivars().timings.borrow().len() > 2048 {
-            self.ivars().timings.borrow_mut().pop_front();
+        if frozen {
+            self.poll();
         }
-        self.redraw();
+        model::push_history(
+            &mut self.ivars().timings.borrow_mut(),
+            (format!("{action:?}"), start.elapsed().as_secs_f64() * 1000.),
+            2048,
+        );
+        let table_only =
+            previous_end.is_some_and(|end| end == self.ivars().state.borrow().can_end());
+        self.redraw_interaction(table_only);
         self.displayIfNeeded();
+        if let Some(table) = self.ivars().live_table.borrow().as_ref() {
+            table.displayIfNeeded();
+        }
         unsafe {
             NSAccessibilityPostNotification(self, NSAccessibilityLayoutChangedNotification);
         }
-        self.ivars().timings.borrow_mut().push_back((
-            format!("paint:{action:?}"),
-            start.elapsed().as_secs_f64() * 1000.,
-        ));
+        model::push_history(
+            &mut self.ivars().timings.borrow_mut(),
+            (
+                format!("paint:{action:?}"),
+                start.elapsed().as_secs_f64() * 1000.,
+            ),
+            2048,
+        );
     }
     fn act(&self, action: Action) {
         if self.ivars().state.borrow().dialog.is_some()
@@ -649,7 +1343,7 @@ impl Canvas {
 
         if action == Action::Quit || action == Action::Close {
             self.ivars().state.borrow().save();
-            self.ivars().state.borrow().shared.lock().unwrap().stop = true;
+            self.ivars().state.borrow().shared.stop();
             unsafe {
                 NSApplication::sharedApplication(self.mtm()).terminate(None);
             }
@@ -679,40 +1373,40 @@ impl Canvas {
  Action::None=>{s.menus.clear();},Action::Page(n)=>{s.focus=Action::None;if s.page != n {s.set_page(n)}},Action::Resource(n)=>{s.resource=n;s.menus.clear();},Action::Collapse=>s.collapsed=!s.collapsed,
  Action::Sort(k)=>{if s.sort==k{s.ascending=!s.ascending}else{s.ascending=!s.columns.iter().find(|c|c.key==k).is_some_and(|c|c.numeric);s.sort=k;}s.sort_rows();},Action::Select(id)=>{s.selections.clear();s.selected=Some(id);s.menus.clear();},Action::Expand(id)=>{if !s.expanded.remove(&id){s.expanded.insert(id);}s.rebuild();},Action::Run=>{s.dialog=Some(Dialog{title:"Create new task".into(),message:"Type the name of an application or its full path.".into(),ok:"OK".into(),action:Action::Option("run-confirm".into()),input:true});if let Some(f)=self.ivars().input.get(){f.setStringValue(ns_string!(""));}drop(s);self.layout_fields();if let(Some(f),Some(w))=(self.ivars().input.get(),self.window()){w.makeFirstResponder(Some(f));}return},
  Action::End=>{if !s.can_end(){return}let name=format!("{} ({} processes)",s.current().unwrap().name,s.selected_processes().len());s.dialog=Some(Dialog{title:format!("End {name}?"),message:"Unsaved data may be lost. The selected application\nand its grouped processes will be terminated.".into(),ok:"End task".into(),action:Action::Signal(libc::SIGTERM),input:false});s.menus.clear();},
- Action::Signal(signal)=>{let processes=s.selected_processes().into_iter().cloned().collect::<Vec<_>>();if processes.is_empty(){return}s.busy=true;let shared=s.shared.clone();std::thread::spawn(move||{let result=processes.iter().try_for_each(|p|p.revalidate()).and_then(|_|processes.iter().try_for_each(|p|p.signal(signal))).map(|_|String::new());let mut q=shared.lock().unwrap();q.results.push_back(Delivery::Operation(result));q.refresh=true;});},
- Action::Priority(n)=>{if let Some(p)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let result=p.priority(n).map(|_|String::new());shared.lock().unwrap().results.push_back(Delivery::Operation(result));});}},
- Action::Efficiency=>{s.menus.clear();s.dialog=Some(Dialog{title:if s.power_on{"Turn off Low Power Mode?"}else{"Turn on Low Power Mode?"}.into(),message:"Efficiency mode controls this Mac's Low Power Mode.\nIt changes the current power-source profile for the\nwhole Mac. macOS will ask for administrator approval.\nThe other power-source profile will stay unchanged.".into(),ok:if s.power_on{"Restore"}else{"Turn on"}.into(),action:Action::Option("power-confirm".into()),input:false});},
+ Action::Signal(signal)=>{let processes=s.selected_processes().into_iter().cloned().collect::<Vec<_>>();if processes.is_empty(){return}s.busy=true;let shared=s.shared.clone();std::thread::spawn(move||{let result=processes.iter().try_for_each(|p|p.revalidate()).and_then(|_|processes.iter().try_for_each(|p|p.signal(signal))).map(|_|String::new());let mut q=shared.data.lock().unwrap();q.results.push_back(Delivery::Operation(result));q.refresh=true;shared.wake.notify_all();drop(q);shared.notify_ui();});},
+ Action::Priority(n)=>{if let Some(p)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let result=p.priority(n).map(|_|String::new());shared.deliver(Delivery::Operation(result));});}},
+ Action::Efficiency=>{let low=NSProcessInfo::processInfo().isLowPowerModeEnabled();s.menus.clear();s.dialog=Some(Dialog{title:if low{"Turn off Low Power Mode?"}else{"Turn on Low Power Mode?"}.into(),message:"Efficiency mode controls this Mac's Low Power Mode.\nIt changes the current power-source profile for the\nwhole Mac. macOS will ask for administrator approval.\nThe other power-source profile will stay unchanged.".into(),ok:if low{"Restore"}else{"Turn on"}.into(),action:Action::Option("power-confirm".into()),input:false});},
  Action::DialogCancel=>{s.dialog=None;s.dialog_scroll=0.;},Action::DialogOk=>{let next=s.dialog.take().map(|d|d.action).unwrap_or(Action::None);drop(s);self.act(next);return},
  Action::View=>{let items=view_menu(&s);let x=(s.width-270.).max(0.);open_menu(&mut s,items,x,90.);},Action::Menu(_)=>{},Action::Option(value)=>{if let Some((depth,index))=parse_menu(&value){if let Some(menu)=s.menus.get(depth){if let Some(item)=menu.items.get(index).cloned(){if !item.enabled{return}if !item.children.is_empty(){let x=if menu.x+504.>s.width{(menu.x-252.).max(0.)}else{menu.x+252.};let y=menu.y.min((s.height-menu_height(&item.children)).max(0.));s.menus.truncate(depth+1);s.menus.push(Menu{x,y,items:item.children,selected:None});}else{s.menus.clear();drop(s);self.act(item.action);return}}}return}
   if value=="search-clear"{s.query.clear();if let Some(f)=self.ivars().search.get(){f.setStringValue(ns_string!(""));}s.rebuild();}
-  else if value=="run-confirm"{let text=self.ivars().input.get().map(|f|f.stringValue().to_string()).unwrap_or_default();let text=text.trim().to_string();if text.is_empty(){return}let shared=s.shared.clone();std::thread::spawn(move||{let result=if text.starts_with('/'){services::command("/usr/bin/open",&[&text],Duration::from_secs(5))}else{services::command("/usr/bin/open",&["-a",&text],Duration::from_secs(5))};shared.lock().unwrap().results.push_back(Delivery::Operation(result));});}
-  else if value=="power-confirm"{s.busy=true;let restore=s.prefs.restore.clone();let shared=s.shared.clone();std::thread::spawn(move||{let result=(||{let source=power::source();let profiles=power::read();let profile=*profiles.get(&source).ok_or("Low Power Mode is unavailable for this power source.")?;let target=if profile.mode==1{restore.get(&source).copied().filter(|v|*v!=1).unwrap_or(0)}else{1};power::set(&source,profile,target)?;Ok((source,profile.mode,target))})();shared.lock().unwrap().results.push_back(Delivery::Power(result));});}
+  else if value=="run-confirm"{let text=self.ivars().input.get().map(|f|f.stringValue().to_string()).unwrap_or_default();let text=text.trim().to_string();if text.is_empty(){return}let shared=s.shared.clone();std::thread::spawn(move||{let result=if text.starts_with('/'){services::command("/usr/bin/open",&[&text],Duration::from_secs(5))}else{services::command("/usr/bin/open",&["-a",&text],Duration::from_secs(5))};shared.deliver(Delivery::Operation(result));});}
+  else if value=="power-confirm"{s.busy=true;let restore=s.prefs.restore.clone();let shared=s.shared.clone();std::thread::spawn(move||{let result=(||{let source=power::source();let profiles=power::read();let profile=*profiles.get(&source).ok_or("Low Power Mode is unavailable for this power source.")?;let target=if profile.mode==1{restore.get(&source).copied().filter(|v|*v!=1).unwrap_or(0)}else{1};power::set(&source,profile,target)?;Ok((source,profile.mode,target))})();shared.deliver(Delivery::Power(result));});}
   else if value=="force" {if s.can_end(){let n=s.selected_processes().len();s.dialog=Some(Dialog{title:"Force quit selected processes?".into(),message:format!("{n} process(es) will stop immediately.\nUnsaved data may be lost."),ok:"Force quit".into(),action:Action::Signal(libc::SIGKILL),input:false});}}
   else if value=="copy-properties" {if let Some(d)=&s.dialog{let pb=NSPasteboard::generalPasteboard();pb.clearContents();unsafe{pb.setString_forType(&NSString::from_str(&d.message),NSPasteboardTypeString);}}}
-  else if value=="copy-pid" || value=="copy-path" {if let Some(p)=s.process(){let text=if value=="copy-pid"{p.raw.pid.to_string()}else{p.path.clone()};let pb=NSPasteboard::generalPasteboard();pb.clearContents();unsafe{pb.setString_forType(&NSString::from_str(&text),NSPasteboardTypeString);}}}
+  else if value=="copy-pid" || value=="copy-path" {if let Some(p)=s.process(){let text=if value=="copy-pid"{p.raw.pid.to_string()}else{p.info.path.clone()};let pb=NSPasteboard::generalPasteboard();pb.clearContents();unsafe{pb.setString_forType(&NSString::from_str(&text),NSPasteboardTypeString);}}}
   else if value=="manage-users"{open_url("x-apple.systempreferences:com.apple.Users-Groups-Settings.extension");}
   else if value=="feedback"{open_url("https://github.com/hotredsam/task-manager-macos/issues/new");}
   else if value=="open-services"{open_url("x-apple.systempreferences:com.apple.LoginItems-Settings.extension");}
   else if value=="memory-percent"{s.memory_percent=true;s.rebuild();}else if value=="memory-values"{s.memory_percent=false;s.rebuild();}
   else if let Some(key)=value.strip_prefix("column:"){let page=s.page;let defaults=columns(page).iter().filter(|c|!s.columns.iter().any(|v|v.key==c.key)).map(|c|c.key.clone()).collect();let hidden=s.prefs.hidden.entry(page).or_insert(defaults);if !hidden.remove(key){hidden.insert(key.into());}s.reset_columns();s.rebuild();}
-  else if let Some(n)=value.strip_prefix("speed:").and_then(|n|n.parse::<u64>().ok()){s.prefs.speed=n;s.shared.lock().unwrap().speed=n;s.history.reset_baseline();}
+  else if let Some(n)=value.strip_prefix("speed:").and_then(|n|n.parse::<u64>().ok()){if (s.prefs.speed==0)!=(n==0){s.history.reset_baseline();}s.shared.set_speed(n);s.prefs.speed=n;}
   else if let Some(n)=value.strip_prefix("start:").and_then(|n|n.parse::<usize>().ok()){s.prefs.start=n.min(7);}
   else if value=="theme:light"{s.prefs.dark=false;s.prefs.system_theme=false;}else if value=="theme:dark"{s.prefs.dark=true;s.prefs.system_theme=false;}else if value=="theme:system"{s.prefs.system_theme=true;s.prefs.dark=NSUserDefaults::standardUserDefaults().stringForKey(ns_string!("AppleInterfaceStyle")).is_some();}
   else if let Some(n)=value.strip_prefix("history:").and_then(|n|n.parse::<usize>().ok()){s.prefs.graph_seconds=n.clamp(30,300);}
   else if value=="units:binary"{s.prefs.binary=true;s.rebuild();}else if value=="units:decimal"{s.prefs.binary=false;s.rebuild();}
-  else if let Some(a)=value.strip_prefix("service-confirm:"){if let Some(i)=s.current().and_then(|r|r.service){let service=s.services[i].clone();let a=a.to_string();let shared=s.shared.clone();s.busy=true;std::thread::spawn(move||{let result=services::change(&service,&a);let mut q=shared.lock().unwrap();q.results.push_back(Delivery::Operation(result));q.scan=true;});}}
+  else if let Some(a)=value.strip_prefix("service-confirm:"){if let Some(i)=s.current().and_then(|r|r.service){let service=s.services[i].clone();let a=a.to_string();let shared=s.shared.clone();s.busy=true;std::thread::spawn(move||{let result=services::change(&service,&a);let mut q=shared.data.lock().unwrap();q.results.push_back(Delivery::Operation(result));q.scan=true;shared.wake.notify_all();drop(q);shared.notify_ui();});}}
   s.prefs.save();
  },
  Action::Service(action)=>{if let Some(i)=s.current().and_then(|r|r.service){if s.services[i].mutable{s.dialog=Some(Dialog{title:format!("{} service?",action.to_uppercase()),message:format!("{}\nThis changes your user LaunchAgent.\nThe operation can affect its running application.",s.services[i].label),ok:action.clone(),action:Action::Option(format!("service-confirm:{action}")),input:false});}}},
- Action::Refresh=>{let mut q=s.shared.lock().unwrap();q.refresh=true;q.scan=true;},Action::ResetHistory=>{s.history=Default::default();s.rebuild();},Action::Logical(on)=>s.prefs.logical=on,Action::Kernel=>s.prefs.kernel=!s.prefs.kernel,Action::Summary=>s.summary=!s.summary,Action::GraphOnly=>s.graph_only=!s.graph_only,
+ Action::Refresh=>{let mut q=s.shared.data.lock().unwrap();q.refresh=true;q.scan=q.services_visible;s.shared.wake.notify_all();},Action::ResetHistory=>{s.history=Default::default();s.rebuild();},Action::Logical(on)=>s.prefs.logical=on,Action::Kernel=>s.prefs.kernel=!s.prefs.kernel,Action::Summary=>s.summary=!s.summary,Action::GraphOnly=>s.graph_only=!s.graph_only,
  Action::Copy=>{let text=if s.page==1{format!("{}\nCPU: {:0.1}%\nMemory: {} / {}\nLogical processors: {}",model::cstr(&s.system.raw.brand),s.system.cpu,model::bytes(s.system.used()as f64,s.prefs.binary),model::bytes(s.system.raw.ram as f64,s.prefs.binary),s.system.raw.logical)}else{s.current().map(|r|format!("{}\n{}",r.name,s.columns.iter().map(|c|format!("{}: {}",c.title,s.row_value(r,&c.key))).collect::<Vec<_>>().join("\n"))).unwrap_or_default()};let pb=NSPasteboard::generalPasteboard();pb.clearContents();unsafe{pb.setString_forType(&NSString::from_str(&text),NSPasteboardTypeString);}},
- Action::Properties=>{s.inspector_generation=s.inspector_generation.wrapping_add(1);let generation=s.inspector_generation;s.dialog_scroll=0.;if let Some(r)=s.current().cloned(){if let Some(process)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let message=process_details(&process);shared.lock().unwrap().results.push_back(Delivery::Inspector(generation,message));});}let message=if let Some(i)=r.service{let q=&s.services[i];format!("Name: {}\nStatus: {}\nDomain: {}\nProgram: {}\nConfiguration: {}",q.label,q.status(),q.domain,q.program,q.path)}else if let Some(p)=s.process(){format!("Name: {}\nPID: {}  Parent PID: {}\nUser: {}  Status: {}\nCPU: {:0.1}%  Memory: {}\nPath: {}",p.name,p.raw.pid,p.raw.ppid,p.user,p.status(),p.cpu,model::bytes(p.raw.memory as f64,s.prefs.binary),p.path)}else{r.name.clone()};s.dialog=Some(Dialog{title:format!("{} Properties",r.name),message,ok:"OK".into(),action:Action::None,input:false});}},
- Action::Reveal=>{let path=s.process().map(|p|p.path.clone()).or_else(||s.current().and_then(|r|r.service).map(|i|s.services[i].path.clone()));if let Some(path)=path{std::thread::spawn(move||{let _=services::command("/usr/bin/open",&["-R",&path],Duration::from_secs(5));});}},Action::SearchOnline=>{if let Some(r)=s.current(){let encoded=r.name.bytes().map(|b|if b.is_ascii_alphanumeric()||b==b'-'{(b as char).to_string()}else{format!("%{b:02X}")}).collect::<String>();open_url(&format!("https://www.bing.com/search?q={encoded}"));}},
+ Action::Properties=>{s.inspector_generation=s.inspector_generation.wrapping_add(1);let generation=s.inspector_generation;s.dialog_scroll=0.;if let Some(r)=s.current().cloned(){if let Some(process)=s.process().cloned(){let shared=s.shared.clone();std::thread::spawn(move||{let message=process_details(&process);shared.deliver(Delivery::Inspector(generation,message));});}let message=if let Some(i)=r.service{let q=&s.services[i];format!("Name: {}\nStatus: {}\nDomain: {}\nProgram: {}\nConfiguration: {}",q.label,q.status(),q.domain,q.program,q.path)}else if let Some(p)=s.process(){format!("Name: {}\nPID: {}  Parent PID: {}\nUser: {}  Status: {}\nCPU: {:0.1}%  Memory: {}\nPath: {}",p.info.name,p.raw.pid,p.raw.ppid,p.info.user,p.status(),p.cpu,model::bytes(p.raw.memory as f64,s.prefs.binary),p.info.path)}else{r.name.clone()};s.dialog=Some(Dialog{title:format!("{} Properties",r.name),message,ok:"OK".into(),action:Action::None,input:false});}},
+ Action::Reveal=>{let path=s.process().map(|p|p.info.path.clone()).or_else(||s.current().and_then(|r|r.service).map(|i|s.services[i].path.clone()));if let Some(path)=path{std::thread::spawn(move||{let _=services::command("/usr/bin/open",&["-R",&path],Duration::from_secs(5));});}},Action::SearchOnline=>{if let Some(r)=s.current(){let encoded=r.name.bytes().map(|b|if b.is_ascii_alphanumeric()||b==b'-'{(b as char).to_string()}else{format!("%{b:02X}")}).collect::<String>();open_url(&format!("https://www.bing.com/search?q={encoded}"));}},
  Action::GoDetails=>{let pid=s.process().map(|p|p.id()).or_else(||s.current().and_then(|r|r.service).and_then(|i|s.services[i].pid).and_then(|pid|s.records.iter().find(|p|p.raw.pid==pid).map(|p|p.id())));s.set_page(5);s.selected=pid;s.selected_visible();},
- Action::Switch=>{if s.page==2{if let Some(row)=s.current(){let path=row.icon.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});}}else if let Some(p)=s.process(){if !p.app.is_empty(){let path=p.app.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});if s.prefs.minimize{if let Some(w)=self.window(){w.miniaturize(None);}}}}},
+ Action::Switch=>{if s.page==2{if let Some(row)=s.current(){let path=row.icon.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});}}else if let Some(p)=s.process(){if !p.info.app.is_empty(){let path=p.info.app.clone();std::thread::spawn(move||{let _=services::command("/usr/bin/open",&[&path],Duration::from_secs(5));});if s.prefs.minimize{if let Some(w)=self.window(){w.miniaturize(None);}}}}},
  Action::Snap(n)=>{if let Some(w)=self.window(){if let Some(screen)=w.screen(){let mut r=screen.visibleFrame();if self.ivars().restore.borrow().is_none(){*self.ivars().restore.borrow_mut()=Some(w.frame())}r.size.width/=2.;if n==1{r.origin.x+=r.size.width;}w.setFrame_display(r,true);}}},
- Action::Setting(key)=>{match key.as_str(){"top"=>{s.prefs.top=!s.prefs.top;if let Some(w)=self.window(){w.setLevel(if s.prefs.top{3}else{0});}},"minimize"=>s.prefs.minimize=!s.prefs.minimize,"hide"=>s.prefs.hide=!s.prefs.hide,"history-all"=>{s.prefs.history_all=!s.prefs.history_all;s.rebuild();},"login"=>{drop(s);self.change_login();return;},"grouped"=>{s.prefs.grouped=!s.prefs.grouped;s.rebuild();},_=>{let items=setting_menu(&s,&key);let hit=s.hits.iter().find(|h|h.action==Action::Setting(key.clone()));let(x,y)=hit.map(|h|(h.rect[0],h.rect[1]+h.rect[3])).unwrap_or((s.sidebar()+32.,140.));open_menu(&mut s,items,x,y);}}s.prefs.save();},
- Action::About=>s.dialog=Some(Dialog{title:"Task Manager".into(),message:"Version 2.0 · Rust + native AppKit\nBuilt for Apple silicon · macOS 14 or later\nOpen source under the MIT license.\nWindows visual references and third-party icon\nrights are documented in the source repository.".into(),ok:"OK".into(),action:Action::None,input:false}),_=>{}}
+ Action::Setting(key)=>{match key.as_str(){"top"=>{s.prefs.top=!s.prefs.top;if let Some(w)=self.window(){w.setLevel(if s.prefs.top{NSFloatingWindowLevel}else{NSNormalWindowLevel});}},"minimize"=>s.prefs.minimize=!s.prefs.minimize,"hide"=>s.prefs.hide=!s.prefs.hide,"history-all"=>{s.prefs.history_all=!s.prefs.history_all;s.rebuild();},"login"=>{drop(s);self.change_login();return;},"grouped"=>{s.prefs.grouped=!s.prefs.grouped;s.rebuild();},_=>{let items=setting_menu(&s,&key);let hit=s.hits.iter().find(|h|h.action==Action::Setting(key.clone()));let(x,y)=hit.map(|h|(h.rect[0],h.rect[1]+h.rect[3])).unwrap_or((s.sidebar()+32.,140.));open_menu(&mut s,items,x,y);}}s.prefs.save();},
+ Action::About=>s.dialog=Some(Dialog{title:"Task Manager".into(),message:concat!("Version ",env!("CARGO_PKG_VERSION")," · Rust + native AppKit\nBuilt for Apple silicon · macOS 14 or later\nOpen source under the MIT license.\nWindows visual references and third-party icon\nrights are documented in the source repository.").into(),ok:"OK".into(),action:Action::None,input:false}),_=>{}}
     }
 }
 fn open_url(url: &str) {
@@ -798,7 +1492,11 @@ fn graph_menu(s: &State) -> Vec<MenuItem> {
 fn view_menu(s: &State) -> Vec<MenuItem> {
     let mut v = vec![
         MenuItem::new("Run new task", Action::Run),
-        MenuItem::check("Efficiency mode", Action::Efficiency, s.power_on),
+        MenuItem::check(
+            "Efficiency mode",
+            Action::Efficiency,
+            NSProcessInfo::processInfo().isLowPowerModeEnabled(),
+        ),
         MenuItem::new("Refresh now                 F5", Action::Refresh),
         MenuItem::sub("Update speed", setting_menu(s, "speed")),
     ];
@@ -857,7 +1555,7 @@ fn row_menu(s: &State) -> Vec<MenuItem> {
     );
     expand.enabled = r.group;
     let mut switch = MenuItem::new("Switch to", Action::Switch);
-    switch.enabled = s.process().is_some_and(|p| !p.app.is_empty());
+    switch.enabled = s.process().is_some_and(|p| !p.info.app.is_empty());
     let mut end = MenuItem::new("End task", Action::End);
     end.enabled = s.can_end();
     let mut v = vec![
@@ -884,7 +1582,11 @@ fn row_menu(s: &State) -> Vec<MenuItem> {
         ),
         MenuItem::new("Provide feedback", Action::Option("feedback".into())),
         MenuItem::sep(),
-        MenuItem::check("Efficiency mode", Action::Efficiency, s.power_on),
+        MenuItem::check(
+            "Efficiency mode",
+            Action::Efficiency,
+            NSProcessInfo::processInfo().isLowPowerModeEnabled(),
+        ),
         MenuItem::disabled("Debug"),
         MenuItem::disabled("Create dump file"),
         MenuItem::sep(),
@@ -984,6 +1686,7 @@ define_class!(
         fn launched(&self, _n: &NSNotification) {
             let mtm = self.mtm();
             let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
             let canvas = Canvas::new(mtm);
             let window = unsafe {
                 NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -1002,6 +1705,8 @@ define_class!(
                 window.setReleasedWhenClosed(false);
                 window.setContentMinSize(NSSize::new(800., 560.));
             }
+            window.setColorSpace(Some(&NSColorSpace::sRGBColorSpace()));
+            window.setDepthLimit(NSWindowDepth::TwentyfourBitRGB);
             window.setTitle(ns_string!("Task Manager"));
             window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
             window.setTitlebarAppearsTransparent(true);
@@ -1021,23 +1726,14 @@ define_class!(
             window.setFrameAutosaveName(ns_string!("TaskManagerRustWindow"));
             window.setFrameUsingName(ns_string!("TaskManagerRustWindow"));
             window.setLevel(if canvas.ivars().state.borrow().prefs.top {
-                3
+                NSFloatingWindowLevel
             } else {
-                0
+                NSNormalWindowLevel
             });
-            // Allocate and initialize AppKit's shared field editor before the first click.
-            if let Some(search) = canvas.ivars().search.get() {
-                unsafe {
-                    let _ = window.fieldEditor_forObject(true, Some(search));
-                }
-                window.makeFirstResponder(Some(search));
-            }
-            window.makeKeyAndOrderFront(None);
+            window.setInitialFirstResponder(Some(&canvas));
             window.makeFirstResponder(Some(&canvas));
+            window.makeKeyAndOrderFront(None);
             install_menu(&canvas, mtm);
-            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            #[allow(deprecated)]
-            app.activateIgnoringOtherApps(true);
             self.ivars().window.set(window).unwrap();
             self.ivars().canvas.set(canvas).ok();
         }
@@ -1049,7 +1745,7 @@ define_class!(
         fn will_terminate(&self, _n: &NSNotification) {
             if let Some(c) = self.ivars().canvas.get() {
                 c.ivars().state.borrow().save();
-                c.ivars().state.borrow().shared.lock().unwrap().stop = true;
+                c.ivars().state.borrow().shared.stop();
             }
         }
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
@@ -1121,84 +1817,93 @@ extern "C" {
         error: *mut *mut std::ffi::c_void,
     ) -> bool;
 }
-pub fn run() {
-    let mtm = MainThreadMarker::new().expect("AppKit requires the main thread");
-    let app = NSApplication::sharedApplication(mtm);
-    if let Some(path) = NSBundle::mainBundle().resourcePath() {
-        let folder = format!("{path}/Fonts");
-        if let Ok(files) = std::fs::read_dir(folder) {
-            for f in files.flatten() {
-                let p = f.path();
-                if p.extension().and_then(|p| p.to_str()) == Some("ttf") {
-                    let url = NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy()));
-                    unsafe {
-                        CTFontManagerRegisterFontsForURL(
-                            &*url as *const NSURL as *const AnyObject,
-                            1,
-                            std::ptr::null_mut(),
-                        );
-                    }
-                }
-            }
-        }
+fn register_font(path: &std::path::Path) -> bool {
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    unsafe {
+        CTFontManagerRegisterFontsForURL(
+            &*url as *const NSURL as *const AnyObject,
+            1,
+            std::ptr::null_mut(),
+        )
     }
-    // Use existing licensed Office fonts in place; do not copy them into the app.
-    let mut loaded = std::collections::HashSet::new();
+}
+
+fn register_fonts() {
+    let faces = [
+        ("SegoeUI", "segoeui-regular_", "selawk.ttf"),
+        ("SegoeUI-Semibold", "segoeui-semibold_", "selawksb.ttf"),
+    ];
+    let mut available = faces
+        .map(|(name, _, _)| NSFont::fontWithName_size(&NSString::from_str(name), 12.).is_some());
+
     for bundle in [
         "com.microsoft.Word",
         "com.microsoft.Excel",
         "com.microsoft.Powerpoint",
     ] {
-        let app_url = NSWorkspace::sharedWorkspace()
-            .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle));
-        if let Some(url) = app_url {
-            if let Some(path) = url.path() {
-                let mut folders = vec![std::path::PathBuf::from(format!(
-                    "{path}/Contents/Resources/sdx"
-                ))];
-                while let Some(folder) = folders.pop() {
-                    if let Ok(entries) = std::fs::read_dir(folder) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_dir() {
-                                folders.push(path);
-                                continue;
-                            }
-                            let name = entry.file_name().to_string_lossy().to_lowercase();
-                            for face in ["regular", "semibold"] {
-                                if !loaded.contains(face)
-                                    && name.starts_with(&format!("segoeui-{face}_"))
-                                    && name.ends_with(".woff")
-                                {
-                                    let url = NSURL::fileURLWithPath(&NSString::from_str(
-                                        &path.to_string_lossy(),
-                                    ));
-                                    if unsafe {
-                                        CTFontManagerRegisterFontsForURL(
-                                            &*url as *const NSURL as *const AnyObject,
-                                            1,
-                                            std::ptr::null_mut(),
-                                        )
-                                    } {
-                                        loaded.insert(face);
-                                    }
-                                }
-                            }
-                        }
+        if available == [true; 2] {
+            return;
+        }
+        let Some(path) = NSWorkspace::sharedWorkspace()
+            .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle))
+            .and_then(|url| url.path())
+        else {
+            continue;
+        };
+        let root = std::path::PathBuf::from(path.to_string()).join("Contents/Resources/sdx");
+        // Check Office's standard font location before searching older layouts.
+        let preferred = root.join("FA000000002/OfflineFiles");
+        let mut folders = vec![root, preferred];
+        while let Some(folder) = folders.pop() {
+            let Ok(entries) = std::fs::read_dir(folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    folders.push(entry.path());
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !name
+                    .rsplit_once('.')
+                    .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("woff"))
+                {
+                    continue;
+                }
+                let name = name.to_ascii_lowercase();
+                for (index, (_, prefix, _)) in faces.iter().enumerate() {
+                    if !available[index] && name.starts_with(prefix) {
+                        available[index] = register_font(&entry.path());
                     }
-                    if loaded.len() == 2 {
-                        break;
-                    }
+                }
+                if available == [true; 2] {
+                    return;
                 }
             }
         }
-        if loaded.len() == 2 {
-            break;
+    }
+
+    if let Some(path) = NSBundle::mainBundle().resourcePath() {
+        let folder = std::path::Path::new(&path.to_string()).join("Fonts");
+        for (index, (_, _, fallback)) in faces.iter().enumerate() {
+            if !available[index] {
+                register_font(&folder.join(fallback));
+            }
         }
     }
-    let d = Delegate::alloc(mtm).set_ivars(DelegateIvars::default());
-    let d: Retained<Delegate> = unsafe { msg_send![super(d), init] };
-    app.setDelegate(Some(ProtocolObject::from_ref(&*d)));
+}
+
+pub fn run() {
+    let mtm = MainThreadMarker::new().expect("AppKit requires the main thread");
+    let (app, _delegate) = objc2::rc::autoreleasepool(|_| {
+        let app = NSApplication::sharedApplication(mtm);
+        register_fonts();
+        let d = Delegate::alloc(mtm).set_ivars(DelegateIvars::default());
+        let d: Retained<Delegate> = unsafe { msg_send![super(d), init] };
+        app.setDelegate(Some(ProtocolObject::from_ref(&*d)));
+        (app, d)
+    });
     app.run();
 }
 
@@ -1270,14 +1975,13 @@ impl Canvas {
 
 impl AXControl {
     fn perform_press(&self) -> bool {
-        let app = NSApplication::sharedApplication(self.mtm());
-        if let Some(window) = app.mainWindow() {
-            if let Some(view) = window.contentView() {
-                if let Some(canvas) = view.downcast_ref::<Canvas>() {
-                    canvas.dispatch(self.ivars().action.clone());
-                    return true;
-                }
-            }
+        let parent: Option<Retained<AnyObject>> = unsafe { msg_send![self, accessibilityParent] };
+        if let Some(canvas) = parent
+            .as_deref()
+            .and_then(|view| view.downcast_ref::<Canvas>())
+        {
+            canvas.dispatch(self.ivars().action.clone());
+            return true;
         }
         false
     }
@@ -1287,8 +1991,8 @@ fn process_details(p: &model::Process) -> String {
     let mut arguments = vec![0i8; 32768];
     let mut now: model::RawProcess = unsafe { std::mem::zeroed() };
     let same = unsafe { model::tm_read_process(p.raw.pid, &mut now) } != 0
-        && now.start == p.raw.start
-        && now.micro == p.raw.micro;
+        && now.stats.start == p.raw.start
+        && now.stats.micro == p.raw.micro;
     let (args, files) = if same {
         let n = unsafe {
             model::tm_arguments(p.raw.pid, arguments.as_mut_ptr(), arguments.len() as i32)
@@ -1302,17 +2006,22 @@ fn process_details(p: &model::Process) -> String {
     } else {
         ("Process exited or identity changed".into(), -1)
     };
-    let signature = if p.path.is_empty() {
+    let threads = if same && now.stats.valid != 0 && now.stats.threads >= 0 {
+        now.stats.threads.to_string()
+    } else {
+        "Unavailable".into()
+    };
+    let signature = if p.info.path.is_empty() {
         "Unavailable".into()
     } else {
         services::command(
             "/usr/bin/codesign",
-            &["-dv", "--verbose=2", &p.path],
+            &["-dv", "--verbose=2", &p.info.path],
             Duration::from_secs(3),
         )
         .unwrap_or_else(|e| e)
     };
-    format!("Name: {}\nPID: {}    Parent PID: {}\nOwner: {}    Status: {}\nBundle: {}\nArchitecture: {:#x}    Threads: {}    Nice: {}\nStarted: {} (Unix seconds)\nCPU: {:.1}%    Memory: {}\nExecutable: {}\nArguments: {}\nOpen files: {}\nSigning information:\n{}",p.title,p.raw.pid,p.raw.ppid,p.user,p.status(),p.bundle,p.raw.arch,p.raw.threads,p.raw.nice,p.raw.start,p.cpu,model::bytes(p.raw.memory as f64,false),p.path,args,if files>=0{files.to_string()}else{"Unavailable".into()},signature)
+    format!("Name: {}\nPID: {}    Parent PID: {}\nOwner: {}    Status: {}\nBundle: {}\nArchitecture: {:#x}    Threads: {}    Nice: {}\nStarted: {} (Unix seconds)\nCPU: {:.1}%    Memory: {}\nExecutable: {}\nArguments: {}\nOpen files: {}\nSigning information:\n{}",p.info.title,p.raw.pid,p.raw.ppid,p.info.user,p.status(),p.info.bundle,p.raw.arch,threads,p.raw.nice,p.raw.start,p.cpu,model::bytes(p.raw.memory as f64,false),p.info.path,args,if files>=0{files.to_string()}else{"Unavailable".into()},signature)
 }
 #[link(name = "ServiceManagement", kind = "framework")]
 extern "C" {}
@@ -1393,6 +2102,7 @@ impl Canvas {
             count: 0,
             writer: tx,
         });
+        self.start_aux_timer();
     }
     fn record_frame(&self) {
         let capture = {

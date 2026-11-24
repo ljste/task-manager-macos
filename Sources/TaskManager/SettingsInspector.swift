@@ -57,7 +57,7 @@ extension AppController {
     heading("Units")
     popup(["Binary", "Decimal"], defaults.string(forKey: "units") ?? "Binary", "units")
     let note = label(
-      "Destructive actions always require confirmation. Unavailable system metrics appear as —.",
+      "Destructive actions always require confirmation. Unavailable system metrics appear as –.",
       12, .regular, .secondaryLabelColor)
     note.maximumNumberOfLines = 2
     note.lineBreakMode = .byWordWrapping
@@ -193,7 +193,7 @@ extension AppController {
           let d = info as? [String: Any]
         {
           signing =
-            "Identifier: \(d[kSecCodeInfoIdentifier as String] ?? "—")\nTeam: \(d[kSecCodeInfoTeamIdentifier as String] ?? "Unsigned / Apple / ad hoc")"
+            "Identifier: \(d[kSecCodeInfoIdentifier as String] ?? "–")\nTeam: \(d[kSecCodeInfoTeamIdentifier as String] ?? "Unsigned / Apple / ad hoc")"
         }
       }
       let result =

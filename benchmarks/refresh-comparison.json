@@ -1,0 +1,374 @@
+{
+  "hardware": "Apple M2 Pro, 10 logical CPUs, 16 GB RAM",
+  "macos": "27.2.1",
+  "method": "Release builds on the same Mac. Processes page, Name ascending, 1120 x 720 points. Each trial used a separate profile, eight seconds of warm-up after sorting and twenty one-second samples from proc_pid_rusage. CPU is percent of one core. RSS and physical footprint are MiB. Other applications were running.",
+  "resources": {
+    "original_normal": {
+      "interval_ms": 2000,
+      "runs": [
+        {
+          "cpu_one_core_percent": 2.726,
+          "rss_mib": 136.024,
+          "footprint_mib": 103.994
+        },
+        {
+          "cpu_one_core_percent": 3.374,
+          "rss_mib": 165.377,
+          "footprint_mib": 107.703
+        }
+      ],
+      "mean": {
+        "cpu_one_core_percent": 3.05,
+        "rss_mib": 150.7,
+        "footprint_mib": 105.848
+      }
+    },
+    "updated_normal": {
+      "interval_ms": 500,
+      "runs": [
+        {
+          "cpu_one_core_percent": 3.979,
+          "rss_mib": 116.837,
+          "footprint_mib": 81.557
+        },
+        {
+          "cpu_one_core_percent": 3.442,
+          "rss_mib": 125.752,
+          "footprint_mib": 76.475
+        }
+      ],
+      "mean": {
+        "cpu_one_core_percent": 3.711,
+        "rss_mib": 121.294,
+        "footprint_mib": 79.016
+      }
+    },
+    "original_low": {
+      "interval_ms": 4000,
+      "runs": [
+        {
+          "cpu_one_core_percent": 1.792,
+          "rss_mib": 137.492,
+          "footprint_mib": 91.299
+        }
+      ],
+      "mean": {
+        "cpu_one_core_percent": 1.792,
+        "rss_mib": 137.492,
+        "footprint_mib": 91.299
+      }
+    },
+    "updated_low": {
+      "interval_ms": 4000,
+      "runs": [
+        {
+          "cpu_one_core_percent": 0.809,
+          "rss_mib": 113.94,
+          "footprint_mib": 54.049
+        }
+      ],
+      "mean": {
+        "cpu_one_core_percent": 0.809,
+        "rss_mib": 113.94,
+        "footprint_mib": 54.049
+      }
+    }
+  },
+  "model_rebuild": {
+    "original": {
+      "measurement": "model rebuild only; excludes rendering and compositor",
+      "process_count": 653,
+      "results": [
+        {
+          "max_ms": 4.009416,
+          "p50_ms": 1.317375,
+          "p95_ms": 2.5200829999999996,
+          "page": "Processes",
+          "rows": 542,
+          "sort": "name"
+        },
+        {
+          "max_ms": 1.106333,
+          "p50_ms": 0.796625,
+          "p95_ms": 1.005459,
+          "page": "Processes",
+          "rows": 542,
+          "sort": "cpu"
+        },
+        {
+          "max_ms": 1.589708,
+          "p50_ms": 0.799666,
+          "p95_ms": 1.119583,
+          "page": "Processes",
+          "rows": 542,
+          "sort": "memory"
+        },
+        {
+          "max_ms": 1.549083,
+          "p50_ms": 0.79825,
+          "p95_ms": 1.123292,
+          "page": "Processes",
+          "rows": 542,
+          "sort": "disk"
+        },
+        {
+          "max_ms": 4.2066669999999995,
+          "p50_ms": 1.057417,
+          "p95_ms": 3.172292,
+          "page": "Processes",
+          "rows": 542,
+          "sort": "network"
+        },
+        {
+          "max_ms": 0.017333,
+          "p50_ms": 0.012916,
+          "p95_ms": 0.016667,
+          "page": "Users",
+          "rows": 1,
+          "sort": "name"
+        },
+        {
+          "max_ms": 0.017625000000000002,
+          "p50_ms": 0.012083,
+          "p95_ms": 0.016583999999999998,
+          "page": "Users",
+          "rows": 1,
+          "sort": "cpu"
+        },
+        {
+          "max_ms": 0.021208,
+          "p50_ms": 0.011542,
+          "p95_ms": 0.016458,
+          "page": "Users",
+          "rows": 1,
+          "sort": "memory"
+        },
+        {
+          "max_ms": 0.019875,
+          "p50_ms": 0.012125,
+          "p95_ms": 0.015875,
+          "page": "Users",
+          "rows": 1,
+          "sort": "disk"
+        },
+        {
+          "max_ms": 0.07066700000000001,
+          "p50_ms": 0.011916000000000001,
+          "p95_ms": 0.023958,
+          "page": "Users",
+          "rows": 1,
+          "sort": "network"
+        },
+        {
+          "max_ms": 3.107916,
+          "p50_ms": 1.2854999999999999,
+          "p95_ms": 2.5808329999999997,
+          "page": "Details",
+          "rows": 653,
+          "sort": "name"
+        },
+        {
+          "max_ms": 2.936666,
+          "p50_ms": 1.0485,
+          "p95_ms": 2.277542,
+          "page": "Details",
+          "rows": 653,
+          "sort": "cpu"
+        },
+        {
+          "max_ms": 3.9353340000000006,
+          "p50_ms": 0.91975,
+          "p95_ms": 2.6150420000000003,
+          "page": "Details",
+          "rows": 653,
+          "sort": "memory"
+        },
+        {
+          "max_ms": 1.161375,
+          "p50_ms": 0.780666,
+          "p95_ms": 1.014708,
+          "page": "Details",
+          "rows": 653,
+          "sort": "disk"
+        },
+        {
+          "max_ms": 1.403,
+          "p50_ms": 0.886083,
+          "p95_ms": 1.141917,
+          "page": "Details",
+          "rows": 653,
+          "sort": "network"
+        }
+      ]
+    },
+    "updated": {
+      "measurement": "model rebuild only; excludes rendering and compositor",
+      "process_count": 672,
+      "results": [
+        {
+          "max_ms": 0.619125,
+          "p50_ms": 0.460916,
+          "p95_ms": 0.556875,
+          "page": "Processes",
+          "rows": 560,
+          "sort": "name"
+        },
+        {
+          "max_ms": 0.583959,
+          "p50_ms": 0.389333,
+          "p95_ms": 0.44975,
+          "page": "Processes",
+          "rows": 560,
+          "sort": "cpu"
+        },
+        {
+          "max_ms": 0.546667,
+          "p50_ms": 0.378375,
+          "p95_ms": 0.462375,
+          "page": "Processes",
+          "rows": 560,
+          "sort": "memory"
+        },
+        {
+          "max_ms": 0.504166,
+          "p50_ms": 0.38575000000000004,
+          "p95_ms": 0.458,
+          "page": "Processes",
+          "rows": 560,
+          "sort": "disk"
+        },
+        {
+          "max_ms": 0.544958,
+          "p50_ms": 0.405542,
+          "p95_ms": 0.501125,
+          "page": "Processes",
+          "rows": 560,
+          "sort": "network"
+        },
+        {
+          "max_ms": 0.027958,
+          "p50_ms": 0.010625,
+          "p95_ms": 0.010834,
+          "page": "Users",
+          "rows": 1,
+          "sort": "name"
+        },
+        {
+          "max_ms": 0.011250000000000001,
+          "p50_ms": 0.005167,
+          "p95_ms": 0.011042,
+          "page": "Users",
+          "rows": 1,
+          "sort": "cpu"
+        },
+        {
+          "max_ms": 0.014084,
+          "p50_ms": 0.005208999999999999,
+          "p95_ms": 0.012374999999999999,
+          "page": "Users",
+          "rows": 1,
+          "sort": "memory"
+        },
+        {
+          "max_ms": 0.012459000000000001,
+          "p50_ms": 0.0051660000000000005,
+          "p95_ms": 0.005958000000000001,
+          "page": "Users",
+          "rows": 1,
+          "sort": "disk"
+        },
+        {
+          "max_ms": 0.011417,
+          "p50_ms": 0.005291,
+          "p95_ms": 0.010958,
+          "page": "Users",
+          "rows": 1,
+          "sort": "network"
+        },
+        {
+          "max_ms": 0.412166,
+          "p50_ms": 0.34,
+          "p95_ms": 0.392833,
+          "page": "Details",
+          "rows": 672,
+          "sort": "name"
+        },
+        {
+          "max_ms": 0.34654199999999996,
+          "p50_ms": 0.236625,
+          "p95_ms": 0.27545800000000004,
+          "page": "Details",
+          "rows": 672,
+          "sort": "cpu"
+        },
+        {
+          "max_ms": 0.329792,
+          "p50_ms": 0.234416,
+          "p95_ms": 0.29570799999999997,
+          "page": "Details",
+          "rows": 672,
+          "sort": "memory"
+        },
+        {
+          "max_ms": 0.326708,
+          "p50_ms": 0.23374999999999999,
+          "p95_ms": 0.269541,
+          "page": "Details",
+          "rows": 672,
+          "sort": "disk"
+        },
+        {
+          "max_ms": 0.342959,
+          "p50_ms": 0.256667,
+          "p95_ms": 0.294583,
+          "page": "Details",
+          "rows": 672,
+          "sort": "network"
+        }
+      ]
+    }
+  },
+  "visible_cadence": {
+    "normal": {
+      "observation_s": 4,
+      "observed_change_intervals_ms": [
+        476.3,
+        523.7,
+        476.9,
+        503.8,
+        525.3,
+        473.5,
+        486.7
+      ],
+      "median_ms": 486.7,
+      "mean_ms": 495.2
+    },
+    "high": {
+      "observation_s": 4,
+      "observed_change_intervals_ms": [
+        252.3,
+        261.6,
+        254.7,
+        255.8,
+        246.9,
+        254.9,
+        219.2,
+        305.2,
+        264.7,
+        258.4,
+        223.0,
+        256.8,
+        260.3,
+        263.5,
+        259.6
+      ],
+      "median_ms": 256.8,
+      "mean_ms": 255.8
+    },
+    "paused": {
+      "observation_s": 2,
+      "observed_change_intervals_ms": []
+    }
+  },
+  "cadence_method": "Observed changes in the logical CPU graph accessibility labels at roughly 35 ms polling intervals. The initial partial interval is excluded."
+}

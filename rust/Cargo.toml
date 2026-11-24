@@ -1,17 +1,18 @@
 [package]
 name = "task-manager"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 license = "MIT"
 
 [dependencies]
+dispatch2 = "=0.3.1"
 objc2 = "=0.6.4"
 objc2-foundation = "=0.3.2"
 objc2-app-kit = { version = "=0.3.2", default-features = false, features = [
   "std", "NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement",
   "NSAccessibilityProtocols", "NSActionCell", "NSApplication", "NSAttributedString",
-  "NSBitmapImageRep", "NSImageRep", "NSBezierPath", "NSButton", "NSButtonCell", "NSCell", "NSColor", "NSControl",
-  "NSEvent", "NSFont", "NSFontDescriptor", "NSGraphics", "NSGraphicsContext",
+  "NSBitmapImageRep", "NSImageRep", "NSBezierPath", "NSButton", "NSButtonCell", "NSCell", "NSColor", "NSColorSpace", "NSControl",
+  "NSEvent", "NSFont", "NSFontDescriptor", "NSGradient", "NSGraphics", "NSGraphicsContext",
   "NSImage", "NSMenu", "NSMenuItem", "NSParagraphStyle", "NSPasteboard",
   "NSResponder", "NSRunningApplication", "NSScreen", "NSStringDrawing", "NSText", "NSTextField",
   "NSTextFieldCell", "NSTrackingArea", "NSView", "NSWindow", "NSWorkspace",

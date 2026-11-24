@@ -86,7 +86,7 @@ public enum LaunchServices {
             as? [String: Any], let label = dict["Label"] as? String
         else { continue }
         let program =
-          dict["Program"] as? String ?? (dict["ProgramArguments"] as? [String])?.first ?? "—"
+          dict["Program"] as? String ?? (dict["ProgramArguments"] as? [String])?.first ?? "–"
         let jobs = domain == "system" ? systemJobs : userJobs
         let overrides = domain == "system" ? systemDisabled : userDisabled
         let isDisabled = overrides[label] ?? (dict["Disabled"] as? Bool ?? false)
@@ -116,7 +116,7 @@ public enum LaunchServices {
         let disabled = (domain == "system" ? systemDisabled : userDisabled)[label] ?? false
         records.append(
           ServiceRecord(
-            label: label, program: "—", path: "—", domain: domain, mechanism: "Registered job",
+            label: label, program: "–", path: "–", domain: domain, mechanism: "Registered job",
             publisher: label.hasPrefix("com.apple.") ? "Apple" : "Unknown",
             status: disabled ? "Disabled" : (pid != nil ? "Running" : "On demand"), pid: pid,
             disabled: disabled))

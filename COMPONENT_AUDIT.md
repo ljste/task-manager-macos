@@ -1,4 +1,4 @@
-# Windows 11 component audit — Rust release
+# Windows 11 component audit, Rust release
 
 Target: the Windows 11 Task Manager layout with left navigation and a search field. The supplied references span Windows versions. This inventory records the components inspected; it is not a claim that every possible Windows state, accessibility tool, or hardware configuration was tested.
 

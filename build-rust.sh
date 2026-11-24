@@ -6,7 +6,7 @@ cd "$PROJECT_DIR"
 MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --locked --manifest-path rust/Cargo.toml
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 rm -f "$APP_DIR/Contents/MacOS/TaskManager"
-cp rust/target/release/task-manager "$APP_DIR/Contents/MacOS/TaskManagerRust"
+cp "${CARGO_TARGET_DIR:-rust/target}/release/task-manager" "$APP_DIR/Contents/MacOS/TaskManagerRust"
 python3 Scripts/MakeIcon.py "$APP_DIR/Contents/Resources/AppIcon.icns"
 python3 Scripts/VerifyIcon.py "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp -R Assets/Fonts "$APP_DIR/Contents/Resources/"
@@ -22,8 +22,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Task Manager</string>
 <key>CFBundleDisplayName</key><string>Task Manager</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>2.0</string>
-<key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>2.1.0</string>
+<key>CFBundleVersion</key><string>3</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
