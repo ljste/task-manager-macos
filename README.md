@@ -1,10 +1,8 @@
 # Task Manager for macOS
 
-**Windows Task Manager's familiar interface. A native Rust app for your Mac.**
+Task Manager for macOS displays live processes and system activity in the style of Windows 11 Task Manager. This independent port uses Rust, native AppKit drawing and a C bridge to macOS monitoring APIs. It builds on [hotredsam’s Task Manager for macOS](https://github.com/hotredsam/task-manager-macos).
 
-This edition builds on [hotredsam’s Task Manager for macOS](https://github.com/hotredsam/task-manager-macos). It uses Rust, native AppKit drawing and a C bridge to macOS monitoring APIs.
-
-The interface follows the [Windows 11 reference screenshots](VISUAL_REFERENCES.md): right-hand window controls, eight navigation pages, grouped processes, sortable resource columns, context menus, and live performance graphs. [The component audit](COMPONENT_AUDIT.md) and [parity notes](PARITY.md) distinguish implemented behavior from remaining differences. This is an independent project, not an official Microsoft or Apple application.
+The layout follows Windows 11 22H2, with right-hand window controls, eight navigation pages, grouped processes, sortable resource columns, context menus and live performance graphs. The centered search box follows the later Windows 11 design. [Windows 11 visual reference](https://www.windowscentral.com/whats-new-task-manager-windows-11-version-22h2)
 
 ![Native Rust Task Manager showing live CPU cores](docs/preview.png)
 
@@ -64,14 +62,21 @@ Sampling and service discovery run on independent workers. Each delivery wakes t
 
 ## Performance and verification
 
-On the built-in Retina display of an M2 Pro, Task Manager 2.1.0 averaged **2.63% of one CPU core**, **93.56 MiB resident memory** and **30.72 MiB physical footprint** across 3 warmed launches of the Processes page at the default 500 ms refresh. The previous 500 ms release used 107.40 MiB resident in one matched launch. [Benchmark conditions and per-trial readings](VERIFICATION.md)
+On the built-in Retina display of a 10-core M2 Pro, the grouped Processes page showed a visible change every **504 ms** at the median with the default 500 ms refresh. Both releases ran in a foreground, unobstructed 1120 × 720-point window, sorted by Name. Each fresh launch warmed for 60 seconds before 20 one-second kernel measurements.
 
-The response target is **8 ms of app-side work per interaction**. Timings include the shared action handler and synchronous drawing submission; they do **not** measure display scanout, macOS scheduling, or input-to-photon latency. See [VERIFICATION.md](VERIFICATION.md) for measured results and limitations. A Rust rewrite alone is not proof of a universal 8 ms bound.
+| Release | Launches | CPU, % of one core | Resident memory | Physical footprint |
+|---|---:|---:|---:|---:|
+| Previous 500 ms release | 1 | 2.60% | 107.40 MiB | 68.60 MiB |
+| **2.1.0** | **3** | **2.63%** | **93.56 MiB** | **30.72 MiB** |
+
+The three 2.1.0 launches averaged 92.71, 95.24 and 92.72 MiB resident. Their combined mean was 13.84 MiB lower than the matched previous release and 0.77 MiB above the earlier 92.79 MiB warmed benchmark. All three CPU means (2.58%, 2.56%, 2.74%) were below the original 2-second version’s 3.05%. [Raw measurements, visibility checks and update times](benchmarks/warm-resident-memory.json)
+
+Sorting by CPU and Name took 4.19 to 4.70 ms across six measured actions in 2.1.0, compared with 1.05 and 1.13 ms in the previous release. Both met the 8 ms target for app-side work, including drawing submission. The release passed 34 Rust tests and 32 Swift baseline tests. On-screen checks covered all eight pages, live updates, text editing, window management, recording and recovery from drawing allocation failures.
 
 ## Limitations
 
-GPU utilization/engine counters, per-process network use, dynamic CPU clocks, Windows handles, disk active-time percentage, NUMA controls, affinity masks, and Windows dumps are not fabricated. Disk/network pages currently aggregate devices. Services and memory accounting retain macOS semantics. Native font rasterization, dialogs, Snap Layout hover behavior, and some table interactions differ from Windows. Exact pixel identity across operating systems and complete Windows feature equivalence are not claimed.
+macOS supplies the metrics and actions behind the Windows-style interface. Disk and network totals aggregate devices. GPU utilization, per-process network traffic, dynamic CPU clocks and disk active-time percentages are unavailable. Windows-specific features such as affinity masks, NUMA controls and process dumps are also unavailable. Font rendering, native dialogs, window snapping and some table interactions differ from Windows.
 
 ## License
 
-Original source code is **MIT**; see [LICENSE](LICENSE). The original Windows Task Manager icon and proprietary Windows artwork remain third-party assets, excluded from MIT. The icon build verifies the source PNG representations pixel-for-pixel. Segoe UI is used only when already installed (including a licensed Office installation); the bundled fallback is Microsoft's open-source Selawik font. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+The project’s original source code uses the [MIT license](LICENSE). The Windows Task Manager icon and other proprietary Windows artwork retain their third-party rights. The build verifies the icon against the source PNGs. The app uses Segoe UI when available on the Mac and bundles Microsoft’s open-source Selawik as its fallback. [Third-party notices](THIRD_PARTY_NOTICES.txt)

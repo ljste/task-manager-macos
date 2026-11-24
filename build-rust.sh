@@ -11,7 +11,8 @@ python3 Scripts/MakeIcon.py "$APP_DIR/Contents/Resources/AppIcon.icns"
 python3 Scripts/VerifyIcon.py "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp -R Assets/Fonts "$APP_DIR/Contents/Resources/"
 cp LICENSE "$APP_DIR/Contents/Resources/LICENSE.txt"
-cp THIRD_PARTY_NOTICES.md "$APP_DIR/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp THIRD_PARTY_NOTICES.txt "$APP_DIR/Contents/Resources/THIRD_PARTY_NOTICES.txt"
+rm -f "$APP_DIR/Contents/Resources/THIRD_PARTY_NOTICES.md"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
